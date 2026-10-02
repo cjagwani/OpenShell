@@ -19,6 +19,7 @@ mod activity_aggregator;
 mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
+mod isolation_backends;
 mod mechanistic_mapper;
 mod provider_readiness;
 
@@ -100,11 +101,13 @@ enum ReadinessEndpoint {
     Tcp(u16),
 }
 
+#[cfg(unix)]
 enum ReadinessListener {
     Unix(tokio::net::UnixListener),
     Tcp(tokio::net::TcpListener),
 }
 
+#[cfg(unix)]
 impl ReadinessEndpoint {
     fn bind(&self) -> Result<ReadinessListener> {
         match self {
@@ -133,6 +136,7 @@ impl ReadinessEndpoint {
 }
 
 /// Falls back to IPv4 when the network namespace has IPv6 disabled.
+#[cfg(unix)]
 fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
 
@@ -151,6 +155,7 @@ fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
         .or_else(|_| bind(Domain::IPV4, (std::net::Ipv4Addr::UNSPECIFIED, port).into()))
 }
 
+#[cfg(unix)]
 impl ReadinessListener {
     async fn accept(&self) -> std::io::Result<()> {
         match self {
@@ -160,11 +165,13 @@ impl ReadinessListener {
     }
 }
 
+#[cfg(unix)]
 struct ControlReadiness {
     task: tokio::task::JoinHandle<()>,
     endpoint: ReadinessEndpoint,
 }
 
+#[cfg(unix)]
 impl ControlReadiness {
     fn start(
         endpoint: ReadinessEndpoint,
@@ -282,10 +289,26 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 impl Drop for ControlReadiness {
     fn drop(&mut self) {
         self.task.abort();
         self.endpoint.remove();
+    }
+}
+
+#[cfg(not(unix))]
+struct ControlReadiness;
+
+#[cfg(not(unix))]
+impl ControlReadiness {
+    fn start(
+        _endpoint: ReadinessEndpoint,
+        _session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Self> {
+        Err(miette::miette!(
+            "supervisor readiness sockets require a Unix host"
+        ))
     }
 }
 
@@ -571,6 +594,7 @@ pub async fn run_network_proxy(
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
+        None,
         None,
         None,
     )
@@ -982,7 +1006,10 @@ async fn run_sandbox_with_backend(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let remote_network_source = remote_boundary.0.network_mediation_source();
+    let direct_proxy = remote_boundary.0.direct_proxy_configuration();
+    let remote_network_source = direct_proxy
+        .is_none()
+        .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
@@ -1020,7 +1047,8 @@ async fn run_sandbox_with_backend(
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
-            Some(remote_network_source),
+            remote_network_source,
+            direct_proxy,
         )
         .await?,
     );
@@ -1403,7 +1431,11 @@ fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::
     writeln!(file, "exit_code={exit_code}")?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
-    std::fs::File::open(parent)?.sync_all()
+    // Windows cannot open directories through File::open. The marker data is
+    // flushed above and rename still atomically replaces the previous value.
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
@@ -5157,6 +5189,7 @@ mod tests {
         assert!(prepare_network_proxy_tls_dir(Some(writable)).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_exists_only_while_guard_is_live() {
         let root = tempfile::tempdir().unwrap();
@@ -5170,6 +5203,7 @@ mod tests {
         assert!(check_control_readiness(&path).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_tracks_supervisor_session() {
         let root = tempfile::tempdir().unwrap();
@@ -5208,6 +5242,7 @@ mod tests {
         .expect("replacement session restores readiness socket");
     }
 
+    #[cfg(unix)]
     #[test]
     fn tcp_readiness_listener_accepts_ipv4_regardless_of_bindv6only() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -5228,6 +5263,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn tcp_control_readiness_tracks_supervisor_session() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|reserved| reserved.local_addr())
@@ -5268,6 +5304,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn control_readiness_rejects_relative_path() {
         let error = prepare_control_readiness_path(std::path::Path::new("health.sock"))
             .expect_err("relative readiness path must be rejected");
