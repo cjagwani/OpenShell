@@ -110,6 +110,7 @@ top-level workspace targets for check/test:
 --exclude openshell-driver-podman
 --exclude openshell-driver-vault
 --exclude openshell-driver-vm
+--exclude openshell-sandbox
 --exclude openshell-vfio
 ```
 
@@ -119,6 +120,10 @@ The MXC runtime compiles the supervisor, supervisor-process library, and sandbox
 boundary on Windows. The Kubernetes Secrets and Vault libraries still compile
 as gateway dependencies; only their standalone Unix-socket binaries and
 package-level tests are excluded as top-level targets.
+
+The supervisor and supervisor-process packages now participate as top-level
+native check/test targets. Their portable session, attachment, and TCP readiness
+coverage does not enable a Windows isolation runtime.
 
 ## Common Errors
 
