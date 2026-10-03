@@ -135,6 +135,17 @@ impl LoadedPolicy {
     }
 }
 
+impl LoadedPolicy {
+    /// Returns whether a `NetworkConnect` permit scope names `host:port` exactly.
+    fn declares_endpoint(&self, host: &str, port: u16) -> bool {
+        let host = normalize_host(host);
+        self.cedar
+            .dns_endpoints()
+            .iter()
+            .any(|endpoint| endpoint.host == host && endpoint.ports.contains(&port))
+    }
+}
+
 /// One attached provider endpoint, used only for its credential settings.
 #[derive(Debug, Clone)]
 struct ProviderEndpoint {
@@ -478,13 +489,20 @@ impl CedarOnlyEngine {
             },
         };
 
+        let allowed = matches!(action, NetworkAction::Allow { .. });
         // Without these, an allowed CONNECT is relayed without inspection
         // and without provider credential settings.
-        let endpoint_configs = if matches!(action, NetworkAction::Allow { .. }) {
+        let endpoint_configs = if allowed {
             guard.endpoint_configs(&request.host, request.port)?
         } else {
             Vec::new()
         };
+        // Matches the YAML path: an allowed connection to a host the policy
+        // names exactly (not through a glob) may resolve to private
+        // addresses. For Cedar, that is a `NetworkConnect` permit whose scope
+        // names this `host:port`.
+        let exact_declared_endpoint_host =
+            allowed && guard.declares_endpoint(&request.host, request.port);
 
         Ok(EgressAuthorization {
             action,
@@ -492,7 +510,7 @@ impl CedarOnlyEngine {
             // Feeds the transparent-TCP policy-DNS correlation, which no
             // current driver uses; see the module docs.
             matched_endpoints: Vec::<MatchedEndpoint>::new(),
-            exact_declared_endpoint_host: false,
+            exact_declared_endpoint_host,
             generation,
         })
     }
@@ -996,5 +1014,27 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
             1,
             "only Cedar's own inspection config remains"
         );
+    }
+
+    #[test]
+    fn exact_declared_host_follows_the_permit_scope() {
+        let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy parses");
+        assert!(
+            engine
+                .authorize_egress(&curl_input("api.example.com"))
+                .expect("request evaluates")
+                .exact_declared_endpoint_host
+        );
+
+        let glob = CedarOnlyEngine::from_policy_str(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
+               when { resource.host like "*.example.com" };"#,
+        )
+        .expect("policy parses");
+        let authorization = glob
+            .authorize_egress(&curl_input("api.example.com"))
+            .expect("request evaluates");
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert!(!authorization.exact_declared_endpoint_host);
     }
 }
