@@ -80,7 +80,11 @@ python_in_sandbox() {
 # By default the upstream is echo-server.py on this host, reached through the
 # host gateway alias. CEDAR_E2E_UPSTREAM_URL selects another echo service that
 # reflects request bodies, such as https://httpbin.org/anything, for hosts
-# where the alias is not trusted.
+# where the alias is not trusted. On macOS the Docker driver never trusts the
+# alias, so that is the default there.
+if [[ -z "${CEDAR_E2E_UPSTREAM_URL:-}" && "$(uname -s)" == "Darwin" ]]; then
+    CEDAR_E2E_UPSTREAM_URL="https://httpbin.org/anything"
+fi
 if [[ -n "${CEDAR_E2E_UPSTREAM_URL:-}" ]]; then
     ECHO_URL="${CEDAR_E2E_UPSTREAM_URL%/}"
 else

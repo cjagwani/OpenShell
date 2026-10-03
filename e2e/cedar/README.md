@@ -25,8 +25,10 @@ unreachable.
 
 The sandbox only trusts `host.openshell.internal` when it maps to the host
 gateway address the gateway configured, as in CI. Where it does not (for
-example a gateway started with `mise run gateway:docker` on macOS), point the
-suite at an echo service that reflects request bodies instead:
+example a gateway started with `mise run gateway:docker` on macOS), the suite
+needs an echo service that reflects request bodies. On macOS it defaults to
+`https://httpbin.org/anything`, so it needs internet access there. On other
+platforms, select one yourself:
 
 ```shell
 CEDAR_E2E_UPSTREAM_URL=https://httpbin.org/anything bash e2e/cedar/test.sh
