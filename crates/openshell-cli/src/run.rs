@@ -1461,6 +1461,9 @@ fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> 
 /// A YAML policy renders as YAML. A Cedar policy renders as its Cedar text,
 /// followed by its middleware as a separate section, since middleware is
 /// configuration supplied with `--middleware` rather than part of the policy.
+/// When present (the `--full` view), the gateway-managed provider rules follow
+/// in a section of their own; they supply credential settings and grant no
+/// access.
 fn render_policy_text(policy: &SandboxPolicy) -> Result<String> {
     let mut text = openshell_policy::serialize_sandbox_policy(policy)
         .wrap_err("failed to serialize policy")?;
@@ -1475,6 +1478,20 @@ fn render_policy_text(policy: &SandboxPolicy) -> Result<String> {
         }
         text.push_str("---\n# Middleware (set with --middleware)\n");
         text.push_str(&middleware);
+    }
+    if let Some(rules) = openshell_policy::serialize_provider_credential_rules(policy)
+        .wrap_err("failed to serialize provider credential rules")?
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(
+            "---\n# Provider credential rules (managed by the gateway; they grant no access)\n",
+        );
+        text.push_str(&rules);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
     }
     Ok(text)
 }
@@ -5508,9 +5525,7 @@ fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, Sandb
     }
 
     let mut base_policy = policy.clone();
-    base_policy
-        .network_policies
-        .retain(|name, _| !openshell_policy::is_provider_rule_name(name));
+    openshell_policy::strip_provider_rule_names(&mut base_policy);
     Cow::Owned(base_policy)
 }
 
@@ -6170,11 +6185,12 @@ mod tests {
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
         format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
         parse_credential_expiry_cli_value, parse_driver_config_json,
-        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
-        render_policy_text, resolve_from, rootfs_tar_sources_supported_for_gateway,
-        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
-        service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
+        parse_secret_material_env_pairs, policy_for_view, policy_revision_list_json,
+        policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
+        ready_false_condition_message, render_policy_text, resolve_from,
+        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
+        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
+        workspace_member_to_json,
     };
 
     #[test]
@@ -7782,5 +7798,33 @@ mod tests {
         assert_eq!(cedar.trim_end(), source);
         assert!(middleware.contains("network_middlewares:"), "{middleware}");
         assert!(middleware.contains("guard"), "{middleware}");
+
+        policy.provider_credential_rules.insert(
+            "_provider_work".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    provider_credentialed: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let full = render_policy_text(&policy_for_view(&policy, PolicyGetView::Full))
+            .expect("render full view");
+        let sections: Vec<&str> = full.split("---\n").collect();
+        assert_eq!(sections.len(), 3, "{full}");
+        assert!(
+            sections[2].contains("# Credentialed endpoints: pypi.org:443"),
+            "{full}"
+        );
+        assert!(sections[2].contains("_provider_work"), "{full}");
+
+        let base = render_policy_text(&policy_for_view(&policy, PolicyGetView::Base))
+            .expect("render base view");
+        assert!(!base.contains("provider_credential_rules"), "{base}");
+        assert!(base.contains("network_middlewares:"), "{base}");
     }
 }

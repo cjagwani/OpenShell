@@ -947,7 +947,9 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// automation can use the same documented field names in either format.
 ///
 /// A Cedar-authored policy renders as its Cedar text in
-/// `cedar_policy_source`, plus `network_middlewares` when it has any.
+/// `cedar_policy_source`, plus `network_middlewares` and the gateway-managed
+/// `provider_credential_rules` (with `provider_credentialed_endpoints`) when it
+/// has any.
 ///
 /// # Errors
 ///
@@ -968,6 +970,19 @@ pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json
     });
     if let Some(middlewares) = json.get("network_middlewares") {
         cedar["network_middlewares"] = middlewares.clone();
+    }
+    if !canonical.provider_credential_rules.is_empty() {
+        let rules_only = SandboxPolicy {
+            version: 1,
+            network_policies: canonical.provider_credential_rules.clone(),
+            ..Default::default()
+        };
+        let rules_json = openshell_policy_schema::policy_to_json_value(&from_proto(&rules_only)?)?;
+        if let Some(rules) = rules_json.get("network_policies") {
+            cedar["provider_credential_rules"] = rules.clone();
+        }
+        cedar["provider_credentialed_endpoints"] =
+            provider_credentialed_endpoints(&canonical).into();
     }
     Ok(cedar)
 }
@@ -998,6 +1013,71 @@ pub fn serialize_network_middlewares(policy: &SandboxPolicy) -> Result<Option<St
             .unwrap_or(&yaml)
             .to_string(),
     ))
+}
+
+/// Lists the provider endpoints that carry credentials, as `host:port[path]`.
+///
+/// These are the endpoints the gateway marked `provider_credentialed` in a
+/// Cedar policy's `provider_credential_rules`, sorted. On a Cedar sandbox a
+/// connection to one is refused unless the Cedar policy inspects it with an
+/// `HttpRequest` policy or the provider allows uninspected credentials.
+#[must_use]
+pub fn provider_credentialed_endpoints(policy: &SandboxPolicy) -> Vec<String> {
+    let mut endpoints: Vec<String> = policy
+        .provider_credential_rules
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .filter(|endpoint| endpoint.provider_credentialed)
+        .flat_map(|endpoint| {
+            let ports = if endpoint.ports.is_empty() {
+                vec![endpoint.port]
+            } else {
+                endpoint.ports.clone()
+            };
+            ports
+                .into_iter()
+                .map(move |port| format!("{}:{port}{}", endpoint.host, endpoint.path))
+        })
+        .collect();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+}
+
+/// Serializes the gateway-managed provider rules of a Cedar policy.
+///
+/// The output is a `provider_credential_rules` section in the same shape as
+/// `network_policies`, for display only: these rules supply credential
+/// settings for attached providers and grant no access. A comment lists the
+/// endpoints that carry credentials (see
+/// [`provider_credentialed_endpoints`]), which the authored YAML schema does
+/// not represent. Returns `None` when the policy has none.
+///
+/// # Errors
+///
+/// Returns an error if the rules are invalid.
+pub fn serialize_provider_credential_rules(policy: &SandboxPolicy) -> Result<Option<String>> {
+    if policy.provider_credential_rules.is_empty() {
+        return Ok(None);
+    }
+    let rules_only = SandboxPolicy {
+        version: 1,
+        network_policies: policy.provider_credential_rules.clone(),
+        ..Default::default()
+    };
+    let yaml = serialize_sandbox_policy(&rules_only)?;
+    let rules = yaml
+        .strip_prefix("version: 1\nnetwork_policies:\n")
+        .ok_or_else(|| miette::miette!("unexpected provider rule serialization"))?;
+    let credentialed = provider_credentialed_endpoints(policy);
+    let comment = if credentialed.is_empty() {
+        String::new()
+    } else {
+        format!("# Credentialed endpoints: {}\n", credentialed.join(", "))
+    };
+    Ok(Some(format!(
+        "{comment}provider_credential_rules:\n{rules}"
+    )))
 }
 
 /// Reads a middleware file: YAML with only a top-level `network_middlewares` section.
@@ -2345,6 +2425,68 @@ when { context.binary_path == "/usr/bin/curl" };
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&roundtrip_dir).ok();
+    }
+
+    #[test]
+    fn provider_credential_rules_render_for_display_with_credentialed_endpoints() {
+        let mut policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+                       resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#,
+        );
+        policy.provider_credential_rules.insert(
+            "_provider_work_github".to_string(),
+            NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "api.github.com".to_string(),
+                        port: 443,
+                        protocol: "rest".to_string(),
+                        request_body_credential_rewrite: true,
+                        provider_credentialed: true,
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "github.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            provider_credentialed_endpoints(&policy),
+            vec!["api.github.com:443".to_string()]
+        );
+        let rendered = serialize_provider_credential_rules(&policy)
+            .expect("serialize")
+            .expect("policy has provider rules");
+        assert!(
+            rendered.starts_with("# Credentialed endpoints: api.github.com:443\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("provider_credential_rules:\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("_provider_work_github"), "{rendered}");
+        assert!(
+            rendered.contains("request_body_credential_rewrite: true"),
+            "{rendered}"
+        );
+
+        let json = sandbox_policy_to_json_value(&policy).expect("json");
+        assert!(
+            json["provider_credential_rules"]
+                .get("_provider_work_github")
+                .is_some()
+        );
+        assert_eq!(
+            json["provider_credentialed_endpoints"],
+            serde_json::json!(["api.github.com:443"])
+        );
     }
 
     #[test]

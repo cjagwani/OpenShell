@@ -138,6 +138,8 @@ Providers attached to a Cedar sandbox supply credentials but never grant access.
 
 A provider endpoint that carries credentials must be inspected per request, so write an `HttpRequest` policy for it. OpenShell refuses connections to a credentialed endpoint that Cedar does not inspect, unless the provider allows uninspected credentials.
 
+`openshell policy get <name> --full` shows the provider rules delivered to the sandbox in a separate section after the Cedar text and middleware, with a list of the endpoints that carry credentials. `--base` omits them.
+
 ```cedar
 permit (
     principal is Sandbox::Process,
