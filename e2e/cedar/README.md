@@ -43,6 +43,10 @@ Against an ephemeral Docker gateway:
 mise run e2e:cedar
 ```
 
+The suite is also part of `mise run e2e`, and CI runs it as the `cedar` entry of
+the Docker E2E matrix. When `OPENSHELL_BIN` is set, as in CI, the task uses that
+CLI instead of building one.
+
 Against a gateway you already started with `mise run gateway:docker`:
 
 ```shell

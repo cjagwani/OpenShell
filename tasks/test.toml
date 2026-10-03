@@ -61,8 +61,8 @@ run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" ta
 hide = true
 
 [e2e]
-description = "Run all end-to-end tests (Rust + Python + MCP)"
-depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
+description = "Run all end-to-end tests (Rust + Python + MCP + Cedar)"
+depends = ["e2e:rust", "e2e:python", "e2e:mcp", "e2e:cedar"]
 
 ["e2e:test"]
 description = "Build the current checkout and run a named host or Nix test-guest E2E suite"
@@ -261,8 +261,8 @@ run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debu
 ["e2e:cedar"]
 description = "Run the pure-Cedar policy e2e suite (network, filesystem, syscalls, --middleware) against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli",
-  "e2e/with-docker-gateway.sh bash -lc 'OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/cedar/test.sh'",
+  "if [ -z \"${OPENSHELL_BIN:-}\" ]; then cargo build -p openshell-cli; fi",
+  "e2e/with-docker-gateway.sh bash -lc 'OPENSHELL_BIN=\"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\" bash e2e/cedar/test.sh'",
 ]
 
 ["e2e:mechanistic-smoke"]
