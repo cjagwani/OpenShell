@@ -134,12 +134,15 @@ mod tests {
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
+    // Cedar policies add cedar_policy_source and the gateway-managed
+    // provider_credential_rules map to SandboxPolicy in both closures. Existing
+    // rows decode both empty and remain YAML policies.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
+        "6b87e28acfc08df63ed3d7158947f024a9ed147e65ec9cbb6a3d1e408d6881fa";
     const DURABLE_SCHEMA_SHA256: &str =
-        "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
+        "eb72e26c01aaf6df3cf73c2665b9d58ebcee0455a279a1be5c01f9afdfc36fcd";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "12c8ccc39282317fd886ed86de86092150db97cc2fbefb1d09d6b13cefff86e6";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -604,9 +607,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 27),
-                (93, 21),
-                (81, 21),
+                (307, 27),
+                (94, 21),
+                (82, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

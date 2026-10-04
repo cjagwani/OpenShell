@@ -3803,7 +3803,7 @@ impl ComputeRuntime {
 
     async fn restart_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.restart_due_sandboxes().await {
+            if let Err(err) = Box::pin(self.restart_due_sandboxes()).await {
                 warn!(error = %err, "Sandbox restart sweep failed");
             }
             tokio::select! {
@@ -9379,7 +9379,7 @@ mod tests {
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.restart_due_sandboxes().await.unwrap();
+        Box::pin(runtime.restart_due_sandboxes()).await.unwrap();
 
         assert_eq!(driver.stop_calls(), 1);
         assert_eq!(driver.start_calls(), 1);
