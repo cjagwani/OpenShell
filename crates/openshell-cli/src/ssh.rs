@@ -232,10 +232,11 @@ fn ssh_base_command(proxy_command: &str) -> Command {
     command
 }
 
-async fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
+async fn exec_or_wait(command: Command, replace_process: bool) -> Result<i32> {
     if replace_process && std::io::stdin().is_terminal() {
         #[cfg(unix)]
         {
+            let mut command = command;
             let err = command.exec();
             return Err(miette::miette!("failed to exec ssh: {err}"));
         }
@@ -328,6 +329,8 @@ struct ConnectCancellation {
 }
 
 impl ConnectCancellation {
+    // Unix signal registration is fallible; retain the shared API on Windows.
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
     fn new() -> Result<Self> {
         Ok(Self {
             #[cfg(unix)]
@@ -335,6 +338,8 @@ impl ConnectCancellation {
         })
     }
 
+    // Waiting consumes mutable signal state only on Unix.
+    #[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
     async fn wait<F, T>(&mut self, future: F) -> std::result::Result<T, i32>
     where
         F: Future<Output = T>,
@@ -380,6 +385,8 @@ async fn terminate_and_reap_child(child: &mut Child, signal: Signal) -> Result<i
     Ok(128 + signal as i32)
 }
 
+// The shared cancellation state is mutated by the Unix signal receiver.
+#[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
 async fn run_main_attach_supervised(
     session: &SshSessionConfig,
     cancellation: &mut ConnectCancellation,
