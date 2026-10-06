@@ -16,6 +16,12 @@ The client receives the supervisor's live provider state, bearer-token slot, and
 
 The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature and standard backend selection remain unchanged.
 
+The private startup result separates the backend transport payload from optional
+authenticated CONNECT listener settings. Shared networking starts the listener
+only after boundary attachment and confirmation; the supervisor owns policy
+evaluation, live credentials, and listener lifetime. These settings do not add
+a proxy hook to the isolation interface or the shared Sandbox Protocol descriptor.
+
 ## Portable supervisor access
 
 The supervisor consumes the shared isolation backend contract. Its gateway
