@@ -105,11 +105,15 @@ try {
             $env:CARGO_TARGET_DIR = $BuildDirectory
             & mise run --skip-tools "windows:build:$Architecture"
             if ($LASTEXITCODE -ne 0) { throw 'Local Windows build failed; no tests launched.' }
+            & mise run --skip-tools "windows:build:mxc-fixtures:$Architecture"
+            if ($LASTEXITCODE -ne 0) { throw 'MXC E2E fixture build failed; no tests launched.' }
         } finally {
             $env:CARGO_TARGET_DIR = $previousTarget
             Pop-Location
-            $buildLog = Join-Path $repo "build-$target-release.log"
-            if (Test-Path $buildLog) { Copy-Item -LiteralPath $buildLog -Destination $localRun }
+            foreach ($logName in @("build-$target-release.log", "build-$target-mxc-fixtures.log")) {
+                $buildLog = Join-Path $repo $logName
+                if (Test-Path $buildLog) { Copy-Item -LiteralPath $buildLog -Destination $localRun }
+            }
         }
     } else { Write-Warning 'SkipBuild: using existing binaries, not claiming they were rebuilt from this checkout.' }
 
@@ -118,6 +122,7 @@ try {
         $files += @{ source = (Join-Path $BuildDirectory "$target/release/$name"); path = "bin/$name" }
     }
     $examples = 'crates/openshell-driver-mxc/examples'
+    $files += @{ source = (Join-Path $BuildDirectory "$target/release/examples/mxc-forwarding-agent.exe"); path = 'bin/mxc-forwarding-agent.exe' }
     $files += @{ source = (Find-Z3Runtime $BuildDirectory $target $Z3DllPath); path = 'bin/libz3.dll' }
     foreach ($path in @("$examples/run-mxc-e2e.ps1", "$examples/mxc-gateway.toml", 'tasks/scripts/run-mxc-remote.ps1')) {
         $files += @{ source = (Join-Path $repo $path); path = $path }
