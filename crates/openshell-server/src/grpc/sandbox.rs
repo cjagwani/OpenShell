@@ -693,6 +693,7 @@ async fn handle_create_sandbox_inner(
                 exposure.target_port,
                 exposure.authorization_mode,
             )?,
+            exposure.readiness_check.clone(),
         )
         .await
         {
@@ -754,6 +755,7 @@ fn validate_create_sandbox_request_pre_io(
     }
     let mut service_names = HashSet::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
+        crate::service_health::validate_readiness_check(exposure.readiness_check.as_ref())?;
         super::service::validate_service_exposure_request(
             &exposure.service,
             exposure.target_port,
@@ -6845,11 +6847,13 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 service_exposures: vec![
                     SandboxServiceExposure {
+                        readiness_check: None,
                         service: String::new(),
                         target_port: 4500,
                         authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
                     },
                     SandboxServiceExposure {
+                        readiness_check: None,
                         service: "metrics".to_string(),
                         target_port: 9090,
                         authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
@@ -6904,6 +6908,7 @@ mod tests {
                 spec: Some(SandboxSpec::default()),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 service_exposures: vec![SandboxServiceExposure {
+                    readiness_check: None,
                     service: String::new(),
                     target_port: 4500,
                     authorization_mode: 99,
@@ -6952,11 +6957,13 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 service_exposures: vec![
                     SandboxServiceExposure {
+                        readiness_check: None,
                         service: "web".to_string(),
                         target_port: 8080,
                         authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
+                        readiness_check: None,
                         service: "metrics".to_string(),
                         target_port: 9090,
                         authorization_mode: ServiceAuthorizationMode::Strip as i32,
@@ -7041,11 +7048,13 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 service_exposures: vec![
                     SandboxServiceExposure {
+                        readiness_check: None,
                         service: "web".to_string(),
                         target_port: 8080,
                         authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
+                        readiness_check: None,
                         service: "web".to_string(),
                         target_port: 8081,
                         authorization_mode: ServiceAuthorizationMode::Strip as i32,

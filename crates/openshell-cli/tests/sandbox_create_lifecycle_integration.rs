@@ -2895,6 +2895,7 @@ async fn service_expose_forwards_bearer_passthrough_mode() {
         "codex",
         4500,
         openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+        Some("/readyz"),
         "default",
         &tls,
     )
@@ -2906,6 +2907,10 @@ async fn service_expose_forwards_bearer_passthrough_mode() {
     assert_eq!(
         requests[0].authorization_mode(),
         openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
+    assert_eq!(
+        requests[0].readiness_check.as_ref().unwrap().path,
+        "/readyz"
     );
 }
 
