@@ -32,6 +32,10 @@ the authenticated Sandbox Protocol bearer. A backend-owned raw connector lets
 discovery, attachment, and reconnection retain this direction without adding
 MXC interpretation to shared transport or changing host firewall policy.
 
+Authenticated RPCs renew the connection's JWT expiry deadline. Expiry or
+connection shutdown cancels open process and forwarding exchanges, including
+idle streams that have not sent a request yet.
+
 MXC owns separate host-launch and one-use boundary-bootstrap envelopes. Host
 proxy address, authorization, and workload identity stay in the MXC launch
 payload; the authenticated workload proxy URL stays in the MXC bootstrap.
@@ -46,6 +50,12 @@ credentials, independently of opaque provider revisions. Provider file delivery
 is unsupported and rejected before process launch or environment replacement.
 Structured shell exec intent and runtime helpers are also rejected explicitly;
 they must not be silently treated as raw executable launches.
+
+Main launch and raw exec share the authenticated proxy and installed CA
+environment. Exec combines these with the latest provider publication rather
+than retaining startup credentials. Caller environment overrides cannot replace
+the governed proxy or CA settings. Process attachments drain stdout and stderr
+before emitting exit, with a bounded deadline for inherited pipes.
 
 Dynamic service forwarding uses the shared protocol's `LoopbackConnect` request
 and bidirectional stream. The boundary connects to the requested loopback port;

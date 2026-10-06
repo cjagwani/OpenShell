@@ -607,6 +607,15 @@ async fn run_lifecycle_inner(
     context: &LifecycleContext,
     startup_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<(), String> {
+    let main = mxc_main_process_config(
+        context.sandbox.spec.as_ref(),
+        &context.sandbox_config.command,
+    );
+    let workload_binary = resolve_workload_binary(
+        main.command
+            .first()
+            .ok_or_else(|| "MXC workload command is empty".to_string())?,
+    )?;
     create_restricted_state_dir(&context.host_state_dir, "host")?;
     // This directory briefly contains the boundary TLS private key and direct
     // proxy credential. Restrict host access before writing either secret;
@@ -680,7 +689,7 @@ async fn run_lifecycle_inner(
         proxy_addr,
         proxy_authorization: authorization,
         proxy_url,
-        workload_binary: resolve_workload_binary(&context.sandbox_config.command[0])?,
+        workload_binary,
         child_env: sandbox_environment(&context.sandbox),
     }
     .provision()
@@ -713,7 +722,7 @@ async fn run_lifecycle_inner(
     // ProcessContainer launch so unrelated local processes cannot squat it
     // during the more expensive host-side setup.
     drop(proxy_reservation);
-    let mut supervisor = spawn_supervisor(context, &descriptor_path, &auth_bundle_path)?;
+    let mut supervisor = spawn_supervisor(context, &descriptor_path, &auth_bundle_path, &main)?;
     let sandbox_command = encode_windows_command_line(&[
         context.config.sandbox_binary_path.clone(),
         "--bootstrap".to_string(),
@@ -808,11 +817,9 @@ fn spawn_supervisor(
     context: &LifecycleContext,
     descriptor_path: &Path,
     auth_bundle_path: &Path,
+    main: &openshell_core::sandbox_env::MainProcessConfig,
 ) -> Result<Child, String> {
-    let main_process_spec = mxc_main_process_spec(
-        context.sandbox.spec.as_ref(),
-        &context.sandbox_config.command,
-    )?;
+    let main_process_spec = mxc_main_process_spec(main)?;
     let mut command = Command::new(&context.config.supervisor_binary_path);
     command
         .kill_on_drop(true)
@@ -860,16 +867,22 @@ fn spawn_supervisor(
 }
 
 fn mxc_main_process_spec(
+    main: &openshell_core::sandbox_env::MainProcessConfig,
+) -> Result<String, String> {
+    serde_json::to_string(main).map_err(|error| format!("encode MXC main process spec: {error}"))
+}
+
+fn mxc_main_process_config(
     spec: Option<&DriverSandboxSpec>,
     driver_command: &[String],
-) -> Result<String, String> {
+) -> openshell_core::sandbox_env::MainProcessConfig {
     let mut main = openshell_core::sandbox_env::MainProcessConfig::from_driver_spec(spec);
     // Match windows: the MXC driver-config command remains a supported launch
     // source when no canonical command was supplied by the CLI.
     if main.command.is_empty() {
         main.command = driver_command.to_vec();
     }
-    serde_json::to_string(&main).map_err(|error| format!("encode MXC main process spec: {error}"))
+    main
 }
 
 enum RuntimePairExit {
@@ -1247,7 +1260,7 @@ mod tests {
             "/c".into(),
             "echo ok 1> C:/work/result.txt".into(),
         ];
-        let encoded = mxc_main_process_spec(None, &command).unwrap();
+        let encoded = mxc_main_process_spec(&mxc_main_process_config(None, &command)).unwrap();
         let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
         assert_eq!(main.command, command);
         assert!(!main.await_main_process_attachment);
@@ -1255,12 +1268,37 @@ mod tests {
             command: vec!["explicit.exe".into()],
             ..Default::default()
         };
-        let encoded = mxc_main_process_spec(Some(&spec), &command).unwrap();
+        let encoded =
+            mxc_main_process_spec(&mxc_main_process_config(Some(&spec), &command)).unwrap();
         assert_eq!(
             openshell_core::sandbox_env::MainProcessConfig::decode(&encoded)
                 .unwrap()
                 .command,
             spec.command
+        );
+    }
+
+    #[test]
+    fn proxy_identity_uses_the_canonical_workload_command() {
+        let canonical = std::env::var("COMSPEC").unwrap();
+        let spec = DriverSandboxSpec {
+            command: vec![canonical.clone(), "/C".into(), "exit 0".into()],
+            ..Default::default()
+        };
+        let fallback = vec!["not-the-workload.exe".into()];
+        let main = mxc_main_process_config(Some(&spec), &fallback);
+        assert_eq!(main.command, spec.command);
+        assert_eq!(
+            resolve_workload_binary(&main.command[0]).unwrap(),
+            resolve_workload_binary(&canonical).unwrap()
+        );
+        assert_eq!(
+            openshell_core::sandbox_env::MainProcessConfig::decode(
+                &mxc_main_process_spec(&main).unwrap()
+            )
+            .unwrap()
+            .command,
+            main.command
         );
     }
     use super::*;
