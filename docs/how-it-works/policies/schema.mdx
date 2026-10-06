@@ -104,8 +104,8 @@ process:
 ## UI
 
 UI controls require the selected compute driver to advertise
-`openshell.policy.ui.v1` in its extension capabilities. MXC ProcessContainer
-supports this contract. Other drivers reject any explicit UI section, including
+`openshell.policy.ui.v1` in its extension capabilities. Unsupported drivers
+reject any explicit UI section, including
 `ui: {}`, before provisioning. Omit the section to preserve their existing
 behavior.
 

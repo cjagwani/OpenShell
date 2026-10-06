@@ -468,21 +468,12 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
-
-# Fail closed if the observed sandbox was replaced or changed
-openshell sandbox delete my-sandbox \
-  --expected-id <sandbox-id> \
-  --expected-resource-version <resource-version>
 ```
 
 `deletion accepted` means cleanup is still pending. Inspect the sandbox until
 it disappears before assuming completion. An already-absent sandbox succeeds;
 missing workspaces and authorization failures remain errors. Do not blindly
 retry by name if another process might have recreated that name.
-
-Identity preconditions are valid only for one named sandbox, and a resource
-version requires the immutable ID. A mismatch returns `ABORTED` before
-OpenShell mutates gateway state or calls the compute driver.
 
 ### Stop and start sandboxes
 
@@ -513,8 +504,8 @@ This is the most important multi-step workflow. It enables a tight feedback cycl
 Explicit `ui` requires the selected driver to advertise
 `openshell.policy.ui.v1` in its existing supported extension capabilities,
 visible through `openshell gateway info`. Unsupported drivers reject even
-`ui: {}` before provisioning. Omit UI unless requested; MXC ProcessContainer
-maps it to native startup controls. UI changes require sandbox recreation.
+`ui: {}` before provisioning. Omit UI unless requested. UI changes require
+sandbox recreation.
 
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
 repair the complete policy or provider set through the gateway. The workload

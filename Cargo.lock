@@ -4862,7 +4862,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
 ]
 

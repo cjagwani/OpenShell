@@ -407,11 +407,17 @@ mod tests {
         let gateway = gateway_metadata(ExtensionFamily::Compute);
         let extension = extension_metadata(
             ExtensionFamily::Compute,
-            "openshell/mxc",
+            "openshell/test-ui-driver",
             "test",
             [POLICY_UI_V1.to_string()],
         );
-        let result = negotiate(ExtensionFamily::Compute, "mxc", &gateway, Some(extension)).unwrap();
+        let result = negotiate(
+            ExtensionFamily::Compute,
+            "test-ui-driver",
+            &gateway,
+            Some(extension),
+        )
+        .unwrap();
         assert!(
             result
                 .supported_capabilities

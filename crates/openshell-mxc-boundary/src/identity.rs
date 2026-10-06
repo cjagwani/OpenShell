@@ -25,7 +25,7 @@ impl Drop for OwnedHandle {
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn current_appcontainer_sid() -> Result<String, String> {
+pub fn current_appcontainer_sid() -> Result<String, String> {
     // SAFETY: GetCurrentProcessId has no pointer or lifetime preconditions.
     process_appcontainer_sid(unsafe { GetCurrentProcessId() })
 }

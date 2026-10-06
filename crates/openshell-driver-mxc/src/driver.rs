@@ -130,7 +130,7 @@ impl MxcComputeConfig {
             allow_driver_config: self.allow_driver_config,
             resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
                 enabled: false,
-                required_labels: Default::default(),
+                required_labels: std::collections::BTreeMap::new(),
             },
         }
     }

@@ -20,7 +20,7 @@ use openshell_isolation_interface::contract::{
 mod mxc;
 
 /// Trusted binary composition chooses the platform implementation, never the payload.
-pub(super) fn platform_setup() -> &'static dyn BackendSetup {
+pub fn platform_setup() -> &'static dyn BackendSetup {
     #[cfg(target_os = "windows")]
     {
         &mxc::MxcBackendSetup
