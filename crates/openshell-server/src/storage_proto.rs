@@ -135,9 +135,9 @@ mod tests {
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "18206c52e68fdb0af60f8bb8dfaf47d9bc8021222cb49cacffab6352d3ad5549";
+        "3066eb8ed5a0b43381196e5c19716a0e5a284996c0dfe0122750a6e7366beb5d";
     const DURABLE_SCHEMA_SHA256: &str =
-        "76487ab369fc3a4b03a179bb5e7ea6be8d20e380ad5563075dff8ee50e539406";
+        "ebb9153e436a6c042a221ec3daa7bb0d21ad81e31ce841ee1b5144404156802e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "5f5165548d2ec333689fc88ab652af1977760bb976007a634e3ed30f28782424";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;

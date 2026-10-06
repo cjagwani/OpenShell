@@ -19,7 +19,6 @@ mod activity_aggregator;
 mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
-mod isolation_backends;
 mod mechanistic_mapper;
 mod provider_readiness;
 
@@ -669,7 +668,7 @@ pub async fn run_sandbox(
 ) -> Result<i32> {
     // Shared startup retains policy and networking state; box it to keep callers' futures small.
     Box::pin(run_sandbox_with_backend(
-        &backend_setup::OpenShellBackendSetup,
+        backend_setup::platform_setup(),
         SandboxRunConfig {
             command,
             workdir,
@@ -928,7 +927,7 @@ async fn run_sandbox_with_backend(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let bound = selected_backend
+    let (bound, proxy_listener) = selected_backend
         .attach(
             backend_setup::BackendServices {
                 ca_file_paths: ca_file_paths.clone(),
@@ -1011,8 +1010,7 @@ async fn run_sandbox_with_backend(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let direct_proxy = remote_boundary.0.direct_proxy_configuration();
-    let remote_network_source = direct_proxy
+    let remote_network_source = proxy_listener
         .is_none()
         .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
@@ -1053,7 +1051,7 @@ async fn run_sandbox_with_backend(
             #[cfg(target_os = "linux")]
             None,
             remote_network_source,
-            direct_proxy,
+            proxy_listener,
         )
         .await?,
     );

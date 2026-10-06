@@ -16,7 +16,7 @@ use futures::Stream;
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
-    DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
+    DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
@@ -67,10 +67,8 @@ impl MxcBackend {
 #[serde(default, deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)] // independent operator options in the existing TOML schema
 pub struct MxcComputeConfig {
-    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    /// Permit caller-supplied driver JSON. Does not waive workload policy.
     pub allow_driver_config: bool,
-    /// Operator-owned external attachment approval policy.
-    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// Path to `wxc-exec.exe`. Required for live runs.
     pub wxc_exec_path: String,
     pub supervisor_binary_path: String,
@@ -108,8 +106,6 @@ impl Default for MxcComputeConfig {
         Self {
             wxc_exec_path: "wxc-exec.exe".into(),
             allow_driver_config: false,
-            resource_admission:
-                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             supervisor_binary_path: sibling_binary("openshell-supervisor.exe"),
             sandbox_binary_path: sibling_binary("openshell-windows-sandbox.exe"),
             state_dir,
@@ -127,6 +123,18 @@ impl Default for MxcComputeConfig {
 }
 
 impl MxcComputeConfig {
+    /// MXC does not implement external-resource label admission. Keep the
+    /// independent caller configuration gate in the gateway/driver contract.
+    pub fn admission_policy(&self) -> openshell_core::resource_admission::DriverAdmissionConfig {
+        openshell_core::resource_admission::DriverAdmissionConfig {
+            allow_driver_config: self.allow_driver_config,
+            resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
+                enabled: false,
+                required_labels: Default::default(),
+            },
+        }
+    }
+
     /// Validate static MXC configuration without requiring launch credentials.
     ///
     /// Keep executable lookup independent of the gateway's PATH, as in the
@@ -267,16 +275,13 @@ impl MxcComputeBackend {
 
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
-            resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
-                allow_driver_config: self.config.allow_driver_config,
-                resource_admission: self.config.resource_admission.clone(),
-            }
-            .acknowledgement(),
+            resource_admission_policy: self.config.admission_policy().acknowledgement(),
             extension: Some(openshell_core::extension_protocol::extension_metadata(
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/mxc",
                 openshell_core::VERSION,
-                [],
+                (self.config.backend == MxcBackend::ProcessContainer)
+                    .then(|| openshell_core::extension_protocol::POLICY_UI_V1.to_string()),
             )),
             driver_name: DRIVER_NAME.to_string(),
             driver_version: DRIVER_VERSION.to_string(),
@@ -287,23 +292,14 @@ impl MxcComputeBackend {
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
-            supports_ui_policy: true,
         }
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
-        self.config
-            .resource_admission
-            .validate()
-            .map_err(tonic::Status::failed_precondition)?;
         openshell_core::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
             sandbox,
         )?;
-        // Host filesystem grants still have no authoritative label resolver.
-        self.config
-            .resource_admission
-            .reject_unlabelable("MXC host filesystem grants")?;
         if !self.invoker.is_mock() {
             self.config
                 .validate_configuration()
@@ -708,11 +704,8 @@ async fn run_lifecycle_inner(
     let descriptor_path = context.host_state_dir.join(HOST_RUNTIME_DESCRIPTOR_FILE);
     std::fs::write(
         &descriptor_path,
-        provisioning
-            .runtime_descriptor
-            .backend_descriptor()
-            .map_err(|error| error.to_string())?
-            .payload,
+        serde_json::to_vec(&provisioning.runtime_descriptor)
+            .map_err(|error| format!("encode MXC launch data: {error}"))?,
     )
     .map_err(|error| format!("write MXC runtime descriptor: {error}"))?;
     // The supervisor owns the proxy listener. Release only that reservation
@@ -726,7 +719,7 @@ async fn run_lifecycle_inner(
         "--bootstrap".to_string(),
         boundary_config_path.display().to_string(),
         "--log-level".to_string(),
-        openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "warn"),
+        openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "info"),
     ]);
     let mut filesystem = MxcFilesystem {
         readwrite_paths: mapped.readwrite_paths,
@@ -816,10 +809,10 @@ fn spawn_supervisor(
     descriptor_path: &Path,
     auth_bundle_path: &Path,
 ) -> Result<Child, String> {
-    let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
+    let main_process_spec = mxc_main_process_spec(
         context.sandbox.spec.as_ref(),
-    )
-    .map_err(|error| format!("encode MXC main process spec: {error}"))?;
+        &context.sandbox_config.command,
+    )?;
     let mut command = Command::new(&context.config.supervisor_binary_path);
     command
         .kill_on_drop(true)
@@ -832,6 +825,8 @@ fn spawn_supervisor(
         .arg(descriptor_path)
         .arg("--auth-bundle-file")
         .arg(auth_bundle_path)
+        .arg("--workdir")
+        .arg(&context.sandbox_config.cwd)
         .env(
             openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
             openshell_mxc_boundary::BACKEND_NAME,
@@ -848,7 +843,7 @@ fn spawn_supervisor(
         .env(openshell_core::sandbox_env::SANDBOX, &context.sandbox.name)
         .env(
             openshell_core::sandbox_env::LOG_LEVEL,
-            openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "warn"),
+            openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "info"),
         );
     if let Some(ca) = &context.gateway.tls {
         command.env(openshell_core::sandbox_env::TLS_CA, ca);
@@ -862,6 +857,19 @@ fn spawn_supervisor(
     command
         .spawn()
         .map_err(|error| format!("start host openshell-supervisor: {error}"))
+}
+
+fn mxc_main_process_spec(
+    spec: Option<&DriverSandboxSpec>,
+    driver_command: &[String],
+) -> Result<String, String> {
+    let mut main = openshell_core::sandbox_env::MainProcessConfig::from_driver_spec(spec);
+    // Match windows: the MXC driver-config command remains a supported launch
+    // source when no canonical command was supplied by the CLI.
+    if main.command.is_empty() {
+        main.command = driver_command.to_vec();
+    }
+    serde_json::to_string(&main).map_err(|error| format!("encode MXC main process spec: {error}"))
 }
 
 enum RuntimePairExit {
@@ -1232,6 +1240,29 @@ fn platform_event(sandbox_id: String, reason: &str, message: String) -> WatchSan
 // the driver. Keep lifecycle/security tests below during their migration.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mxc_driver_command_reaches_supervisor_without_generic_command() {
+        let command = vec![
+            "cmd.exe".into(),
+            "/c".into(),
+            "echo ok 1> C:/work/result.txt".into(),
+        ];
+        let encoded = mxc_main_process_spec(None, &command).unwrap();
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
+        assert_eq!(main.command, command);
+        assert!(!main.await_main_process_attachment);
+        let spec = DriverSandboxSpec {
+            command: vec!["explicit.exe".into()],
+            ..Default::default()
+        };
+        let encoded = mxc_main_process_spec(Some(&spec), &command).unwrap();
+        assert_eq!(
+            openshell_core::sandbox_env::MainProcessConfig::decode(&encoded)
+                .unwrap()
+                .command,
+            spec.command
+        );
+    }
     use super::*;
 
     #[test]
@@ -1271,23 +1302,38 @@ mod tests {
     fn host_grants_config() -> MxcComputeConfig {
         MxcComputeConfig {
             allow_driver_config: true,
-            resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig {
-                enabled: false,
-                ..Default::default()
-            },
             ..Default::default()
         }
     }
 
     #[tokio::test]
-    async fn admission_rejects_host_grants_even_with_driver_config_enabled() {
+    async fn driver_config_gate_remains_required_without_resource_admission() {
         let (mut backend, sandbox, _dir) = preflight_fixture();
-        backend.config.resource_admission.enabled = true;
+        assert!(backend.validate_sandbox_create(&sandbox).is_ok());
+        backend.config.allow_driver_config = false;
         let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(backend.create_sandbox(&sandbox).await.is_err());
         assert!(backend.get_sandbox(&sandbox.id).await.is_none());
         assert!(!backend.config.state_dir.exists());
+    }
+
+    #[test]
+    fn resource_admission_is_unsupported_and_acknowledged() {
+        let config = MxcComputeConfig::default();
+        let policy = config.admission_policy();
+        assert!(!policy.resource_admission.enabled);
+        assert!(policy.resource_admission.required_labels.is_empty());
+        assert!(!policy.allow_driver_config);
+        policy
+            .verify_acknowledgement(&policy.acknowledgement())
+            .unwrap();
+        assert!(
+            serde_json::from_value::<MxcComputeConfig>(serde_json::json!({
+                "resource_admission": { "enabled": true }
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1356,6 +1402,98 @@ mod tests {
             .validate_sandbox_create(&sandbox)
             .expect("static preflight");
         assert!(!backend.config.state_dir.exists());
+    }
+
+    fn with_ui_policy(
+        mut sandbox: DriverSandbox,
+        ui: openshell_core::proto::UiPolicy,
+    ) -> DriverSandbox {
+        sandbox.spec.as_mut().unwrap().policy.as_mut().unwrap().ui = Some(ui);
+        sandbox
+    }
+
+    #[test]
+    fn ui_policy_reaches_mapper_and_capability_is_advertised() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+        let (backend, sandbox, _dir) = preflight_fixture();
+        assert!(
+            backend
+                .capabilities()
+                .extension
+                .unwrap()
+                .supported_capabilities
+                .iter()
+                .any(|capability| capability == openshell_core::extension_protocol::POLICY_UI_V1)
+        );
+        for clipboard in [
+            UiClipboardAccess::None,
+            UiClipboardAccess::Read,
+            UiClipboardAccess::Write,
+            UiClipboardAccess::All,
+        ] {
+            let sandbox = with_ui_policy(
+                sandbox.clone(),
+                UiPolicy {
+                    allow_graphical_ui: true,
+                    clipboard: clipboard as i32,
+                    allow_input_injection: true,
+                },
+            );
+            backend
+                .validate_sandbox_create(&sandbox)
+                .expect("valid UI policy");
+            let mapped = backend
+                .map_sandbox_policy(
+                    &sandbox.id,
+                    sandbox.spec.as_ref().unwrap().policy.as_ref(),
+                    "127.0.0.1:3128".parse().unwrap(),
+                )
+                .unwrap();
+            let ui = mapped.ui.unwrap();
+            assert!(!ui.disable);
+            assert!(ui.injection);
+            assert!(!backend.config.state_dir.exists());
+        }
+    }
+
+    #[test]
+    fn ui_policy_rejects_invalid_settings_before_provisioning() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+        let (backend, sandbox, _dir) = preflight_fixture();
+        for ui in [
+            UiPolicy {
+                clipboard: 999,
+                ..Default::default()
+            },
+            UiPolicy {
+                clipboard: UiClipboardAccess::Read as i32,
+                ..Default::default()
+            },
+            UiPolicy {
+                allow_input_injection: true,
+                ..Default::default()
+            },
+        ] {
+            let sandbox = with_ui_policy(sandbox.clone(), ui);
+            let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(!backend.config.state_dir.exists());
+        }
+    }
+
+    #[test]
+    fn isolation_session_does_not_advertise_ui_policy() {
+        let (mut backend, _sandbox, _dir) = preflight_fixture();
+        backend.config.backend = MxcBackend::IsolationSession;
+        assert!(
+            !backend
+                .capabilities()
+                .extension
+                .unwrap()
+                .supported_capabilities
+                .iter()
+                .any(|capability| capability == openshell_core::extension_protocol::POLICY_UI_V1)
+        );
     }
 
     #[tokio::test]

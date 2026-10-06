@@ -31,6 +31,10 @@ The resolved create-time `SandboxPolicy` is carried by
 `DriverSandboxSpec.policy`. The driver provisions a one-shot ProcessContainer,
 launches the Windows boundary and separate host supervisor, and monitors both.
 The boundary launches the workload only after authenticated confirmation.
+The driver defaults its paired runtimes to `info` logging so native workload
+launches remain observable. An explicit sandbox log-level setting takes
+precedence. The boundary emits structured process activity and the Windows
+branch's `MXC agent launched` acknowledgement only after native spawn succeeds.
 
 The driver resolves its gateway endpoint and TLS server-name defaults from
 generic gateway inputs. The host supervisor authenticates its gateway session
@@ -43,15 +47,25 @@ embed the supervisor, and the sandbox does not link the compute driver.
 Dynamic forwarding uses the shared protocol stream, not a dedicated relay
 executable or a reverse connection to a new gateway listener.
 
+The boundary establishes its control TCP connection outward from MXC to a
+generation-scoped loopback listener in the host isolation backend, matching the
+Windows branch relay's connection direction. The shared transport connector
+extension preserves pinned boundary TLS identity and supervisor JWT checks;
+the driver neither brokers protocol requests nor runs supervision. Discovery
+and attachment reuse the backend-owned listener, including reconnects. No host
+firewall rule changes are required for this control path.
+
 ## Enforcement boundaries
 
-The current port is not runtime-qualified against main's outer-fence contract.
+The current port temporarily asserts main's required outer-fence guarantees
+to permit Windows-branch compatibility testing. This is an unconditional
+MXC-only stub, not verified enforcement evidence or production qualification.
 Broad host-loopback access does not establish `NoUnmanagedEgressPath`, and
-live access revocation has no verified native evidence. The driver therefore
-does not publish those guarantees, and main's confirmation gate prevents
-workload activation. Configuration intent must not be promoted to enforcement
-proof. A qualified PSEC host is necessary but does not by itself close these
-implementation gaps.
+live access revocation has no verified native evidence. The provisioning TODO
+tracks replacing these assertions with real enforcement. Audit metadata labels
+egress as `mxc-windows-parity-unverified-egress-stub`. AppContainer identity,
+authenticated transport, and generation checks remain required. Do not expose
+sensitive host-local services to workloads using this compatibility path.
 
 - MXC supplies the default-deny filesystem fence, AppContainer token, UI
   policy, and loopback-only network fence.
@@ -72,6 +86,13 @@ implementation gaps.
   and are deleted before workload launch.
 
 ## Configuration
+
+MXC does not implement external-resource label admission. Do not configure
+`resource_admission` under its driver table; unsupported fields are rejected.
+Host filesystem grants rely on workload policy and a trusted gateway operator,
+not resource labels. Caller-supplied command configuration still requires
+`allow_driver_config = true`. Native isolation, authenticated transport, and
+outer-fence confirmation remain required.
 
 The packaged `openshell-supervisor.exe` and `openshell-windows-sandbox.exe` default to
 siblings of `openshell-gateway.exe`. Override their paths for development
@@ -110,9 +131,11 @@ openshell sandbox create --name mxc-demo --policy policy.yaml `
   --driver-config-json $config --no-tty
 ```
 
-The command is required. The working directory is required because it contains
-the generation-scoped bootstrap staging directory. Environment belongs in
-`--env` or `--env-from`, not gateway configuration.
+The command and working directory are required. The working directory contains
+the generation-scoped bootstrap staging directory. When no generic canonical
+command is supplied, the driver passes `mxc.command` to the supervisor rather
+than starting a scratch workload. An explicit generic canonical command retains
+precedence. Environment belongs in `--env` or `--env-from`, not gateway configuration.
 
 When gateway TLS is enabled, configure the gateway-owned `guest_tls_ca`.
 The host supervisor verifies the gateway certificate with that CA and uses
@@ -130,7 +153,68 @@ not required; driver-owned guest TLS fields are rejected.
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer |
 | Gateway restart recovery | Not yet supported; live MXC generations remain in-memory |
 
+UI controls are startup settings in the sandbox policy:
+
+```yaml
+ui:
+  allow_graphical_ui: true
+  clipboard: read
+  allow_input_injection: false
+```
+
+Omitted UI settings deny all three capabilities. Clipboard accepts `none`,
+`read`, `write`, or `all`, from the workload's perspective. Clipboard and input
+injection require graphical UI. Unknown fields/values and unsupported
+containment targets are rejected before provisioning. MXC advertises
+`openshell.policy.ui.v1` through existing extension metadata. The gateway rejects
+explicit UI policy (including `{}`) for drivers missing this capability; those
+drivers need no UI-specific handling. UI policy itself does not require the
+`allow_driver_config` opt-in. Recreate the sandbox to change these settings.
+
 ## Validation
+
+### Remote Windows host
+
+Build on a Windows MSVC development machine and run the unchanged real E2E
+harness on a separate MXC host:
+
+```powershell
+.\tasks\scripts\test-mxc-remote.ps1 -HostName 172.16.178.137 -UserName test `
+  -WxcExecPath 'C:\Tools\MXC\wxc-exec.exe'
+```
+
+Install the public SSH key on the target and verify its host key before running.
+The script defaults to `~/.ssh/openshell-mxc-test`; override `-IdentityFile` as
+needed. Both SSH and SCP must be on PATH locally. The target needs Windows
+OpenSSH Server, OpenSSL on its SSH-session PATH, and a qualified MXC runtime,
+but does not need Rust, MSVC, mise, or a source checkout.
+
+The script detects native Windows architecture independently of the SSH shell,
+uses the existing `windows:build:*` task, and validates the executable PE
+architecture before testing. `-BuildDirectory` selects a dedicated Cargo cache.
+`-SkipBuild` reuses existing artifacts without claiming they match current
+sources. `-Scenario` selects an existing harness scenario.
+
+The package includes `libz3.dll` from the target-specific Cargo build cache.
+Windows prebuilt Z3 uses a dynamic runtime DLL. Supply `-Z3DllPath` if multiple
+different cached versions exist or when using a custom Z3 build. The remote
+host needs the native Visual C++ runtime; the runner validates DLL architecture
+and gateway startup before invoking E2E.
+
+The example gateway explicitly enables caller driver config so tests can submit
+their workload command and directory. MXC does not implement external-resource
+label admission. The temporary outer-fence assertions permit compatibility
+testing but do not qualify exclusive network mediation or live revocation.
+
+Uploads are cached by SHA256 and verified before execution. Each run has an
+isolated remote directory under `%USERPROFILE%\openshell-mxc-tests`; old runs
+are retained. Full logs, host capabilities, source status, artifact hashes, and
+the results ZIP return to `target/windows-remote-results` in this checkout.
+Signing-key directories are not downloaded. Test failures and incomplete
+coverage remain nonzero exits. Missing host-loopback evidence is not a pass,
+and a qualified host does not close the outer-fence implementation gaps above.
+
+### Local Windows host
 
 Run the Windows build lane on a native Windows MSVC host:
 

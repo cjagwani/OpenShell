@@ -16,6 +16,21 @@ use openshell_isolation_interface::contract::{
     ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
 };
 
+#[cfg(target_os = "windows")]
+mod mxc;
+
+/// Trusted binary composition chooses the platform implementation, never the payload.
+pub(super) fn platform_setup() -> &'static dyn BackendSetup {
+    #[cfg(target_os = "windows")]
+    {
+        &mxc::MxcBackendSetup
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &OpenShellBackendSetup
+    }
+}
+
 /// Coordinates decoded by the selected trusted backend. Shared startup checks
 /// these against admission before credentials or discovery reach that backend.
 pub struct LaunchIdentity {
@@ -34,6 +49,14 @@ pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     pub provider_credentials: ProviderCredentialState,
     pub sandbox_bearer: SessionBearerTokenSlot,
+}
+
+/// Private startup result; native payload decoding never reaches shared runtime
+/// descriptors or the public isolation interface.
+pub struct BuiltBackend {
+    pub backend: Arc<dyn IsolationBackend>,
+    pub payload: Vec<u8>,
+    pub proxy_listener: Option<openshell_supervisor_network::run::ProxyListenerConfig>,
 }
 
 /// Selected by trusted composition, never by payload contents. Decoding and
@@ -66,7 +89,7 @@ pub trait PreparedBackend: Send + Sync {
     fn build(
         self: Box<Self>,
         services: BackendServices,
-    ) -> std::result::Result<Arc<dyn IsolationBackend>, BackendError>;
+    ) -> std::result::Result<BuiltBackend, BackendError>;
 }
 
 /// Created only after name and launch identity checks. Consuming attachment
@@ -153,24 +176,28 @@ impl SelectedBackend {
     /// Construct and attach the selected client using the admitted policy and
     /// shared services. Registry verification rejects a differently named client.
     pub async fn attach(
-        self,
+        mut self,
         services: BackendServices,
         policy: SandboxPolicy,
         agent: AgentSpec,
-    ) -> Result<Box<dyn BoundBoundary>> {
-        let backend = self
+    ) -> Result<(
+        Box<dyn BoundBoundary>,
+        Option<openshell_supervisor_network::run::ProxyListenerConfig>,
+    )> {
+        let built = self
             .prepared
             .build(services)
             .map_err(|error| miette::miette!(error.to_string()))?;
+        self.descriptor.payload = built.payload;
         let mut registry = BackendRegistry::new();
         registry
-            .register(backend)
+            .register(built.backend)
             .map_err(|error| miette::miette!(error.to_string()))?;
         let admitted_backend = self.descriptor.backend_name.clone();
         let (backend, verified) = registry
             .resolve(self.descriptor, &admitted_backend)
             .map_err(|error| miette::miette!(error.to_string()))?;
-        backend
+        let bound = backend
             .attach(
                 verified,
                 SandboxContext {
@@ -182,14 +209,17 @@ impl SelectedBackend {
                 },
             )
             .await
-            .map_err(|error| miette::miette!(error.to_string()))
+            .map_err(|error| miette::miette!(error.to_string()))?;
+        Ok((bound, built.proxy_listener))
     }
 }
 
 /// The standard binary selects the `OpenShell` Sandbox Protocol. Its wire schema
 /// and concrete client stay here rather than in the shared startup sequence.
+#[cfg(any(test, not(target_os = "windows")))]
 pub struct OpenShellBackendSetup;
 
+#[cfg(any(test, not(target_os = "windows")))]
 impl BackendSetup for OpenShellBackendSetup {
     fn backend_name(&self) -> &str {
         openshell_sandbox_backend::BACKEND_NAME
@@ -220,8 +250,10 @@ impl BackendSetup for OpenShellBackendSetup {
     }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 struct OpenShellLaunch(openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor);
 
+#[cfg(any(test, not(target_os = "windows")))]
 #[tonic::async_trait]
 impl PreparedBackend for OpenShellLaunch {
     async fn discover_policy(
@@ -235,14 +267,17 @@ impl PreparedBackend for OpenShellLaunch {
     fn build(
         self: Box<Self>,
         services: BackendServices,
-    ) -> std::result::Result<Arc<dyn IsolationBackend>, BackendError> {
-        Ok(Arc::new(
-            openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+    ) -> std::result::Result<BuiltBackend, BackendError> {
+        let payload = self.0.backend_descriptor()?.payload;
+        Ok(BuiltBackend {
+            payload,
+            proxy_listener: None,
+            backend: Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
                 services.ca_file_paths,
                 services.provider_credentials,
                 services.sandbox_bearer,
-            ),
-        ))
+            )),
+        })
     }
 }
 
