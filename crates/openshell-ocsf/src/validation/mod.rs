@@ -8,4 +8,6 @@
 
 pub mod schema;
 
-pub use schema::{load_class_schema, validate_enum_value, validate_required_fields};
+pub use schema::{
+    load_class_schema, load_class_schema_for_version, validate_enum_value, validate_required_fields,
+};
