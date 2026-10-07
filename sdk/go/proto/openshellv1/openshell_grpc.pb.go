@@ -68,6 +68,7 @@ const (
 	OpenShell_GetSandboxConfig_FullMethodName              = "/openshell.v1.OpenShell/GetSandboxConfig"
 	OpenShell_GetGatewayConfig_FullMethodName              = "/openshell.v1.OpenShell/GetGatewayConfig"
 	OpenShell_UpdateConfig_FullMethodName                  = "/openshell.v1.OpenShell/UpdateConfig"
+	OpenShell_GetConfigUpdateOperation_FullMethodName      = "/openshell.v1.OpenShell/GetConfigUpdateOperation"
 	OpenShell_GetSandboxPolicyStatus_FullMethodName        = "/openshell.v1.OpenShell/GetSandboxPolicyStatus"
 	OpenShell_ListSandboxPolicies_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxPolicies"
 	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
@@ -86,6 +87,7 @@ const (
 	OpenShell_PeerReportProviderReadiness_FullMethodName   = "/openshell.v1.OpenShell/PeerReportProviderReadiness"
 	OpenShell_PeerReportEndpointStatus_FullMethodName      = "/openshell.v1.OpenShell/PeerReportEndpointStatus"
 	OpenShell_PeerGetSandboxProviderStatus_FullMethodName  = "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus"
+	OpenShell_PeerNotifyConfigUpdate_FullMethodName        = "/openshell.v1.OpenShell/PeerNotifyConfigUpdate"
 	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
 	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
 	OpenShell_GetDraftPolicy_FullMethodName                = "/openshell.v1.OpenShell/GetDraftPolicy"
@@ -214,6 +216,8 @@ type OpenShellClient interface {
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+	// Polling projection of the sandbox configuration delivered over
+	// ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).
@@ -225,6 +229,8 @@ type OpenShellClient interface {
 	GetGatewayConfig(ctx context.Context, in *sandboxv1.GetGatewayConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetGatewayConfigResponse, error)
 	// Update settings or policy at sandbox or global scope.
 	UpdateConfig(ctx context.Context, in *UpdateConfigRequest, opts ...grpc.CallOption) (*UpdateConfigResponse, error)
+	// Get a durable sandbox configuration update operation by id.
+	GetConfigUpdateOperation(ctx context.Context, in *GetConfigUpdateOperationRequest, opts ...grpc.CallOption) (*GetConfigUpdateOperationResponse, error)
 	// Get the load status of a specific policy version.
 	GetSandboxPolicyStatus(ctx context.Context, in *GetSandboxPolicyStatusRequest, opts ...grpc.CallOption) (*GetSandboxPolicyStatusResponse, error)
 	// List policy history for a sandbox.
@@ -238,7 +244,9 @@ type OpenShellClient interface {
 	ReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
 	// Register startup and acknowledge an exact validated runtime configuration.
 	ReportSandboxConfiguration(ctx context.Context, in *ReportSandboxConfigurationRequest, opts ...grpc.CallOption) (*ReportSandboxConfigurationResponse, error)
-	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
+	// Get provider environment for a sandbox (called by the sandbox supervisor at
+	// startup and by its poll loop). Polling projection of the provider
+	// environment delivered over ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
@@ -251,9 +259,11 @@ type OpenShellClient interface {
 	//
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
-	// SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-	// connection), not over this stream.
+	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
+	// delivery. Supervisors advertise optional stream features in
+	// SupervisorHello, and the gateway sends only payloads the supervisor
+	// advertises. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// streams on the same connection), not over this stream.
 	ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error)
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(ctx context.Context, in *ReportMainProcessExitRequest, opts ...grpc.CallOption) (*ReportMainProcessExitResponse, error)
@@ -283,6 +293,9 @@ type OpenShellClient interface {
 	PeerReportProviderReadiness(ctx context.Context, in *ReportProviderReadinessRequest, opts ...grpc.CallOption) (*ReportProviderReadinessResponse, error)
 	PeerReportEndpointStatus(ctx context.Context, in *ReportEndpointStatusRequest, opts ...grpc.CallOption) (*ReportEndpointStatusResponse, error)
 	PeerGetSandboxProviderStatus(ctx context.Context, in *GetSandboxProviderStatusRequest, opts ...grpc.CallOption) (*GetSandboxProviderStatusResponse, error)
+	// Best-effort notification to the replica that owns a supervisor session.
+	// The receiver rebuilds snapshots from authoritative state.
+	PeerNotifyConfigUpdate(ctx context.Context, in *PeerNotifyConfigUpdateRequest, opts ...grpc.CallOption) (*PeerNotifyConfigUpdateResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -810,6 +823,16 @@ func (c *openShellClient) UpdateConfig(ctx context.Context, in *UpdateConfigRequ
 	return out, nil
 }
 
+func (c *openShellClient) GetConfigUpdateOperation(ctx context.Context, in *GetConfigUpdateOperationRequest, opts ...grpc.CallOption) (*GetConfigUpdateOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetConfigUpdateOperationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetConfigUpdateOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandboxPolicyStatus(ctx context.Context, in *GetSandboxPolicyStatusRequest, opts ...grpc.CallOption) (*GetSandboxPolicyStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxPolicyStatusResponse)
@@ -996,6 +1019,16 @@ func (c *openShellClient) PeerGetSandboxProviderStatus(ctx context.Context, in *
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxProviderStatusResponse)
 	err := c.cc.Invoke(ctx, OpenShell_PeerGetSandboxProviderStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) PeerNotifyConfigUpdate(ctx context.Context, in *PeerNotifyConfigUpdateRequest, opts ...grpc.CallOption) (*PeerNotifyConfigUpdateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PeerNotifyConfigUpdateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_PeerNotifyConfigUpdate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1308,6 +1341,8 @@ type OpenShellServer interface {
 	// Delete a custom provider type profile by id.
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+	// Polling projection of the sandbox configuration delivered over
+	// ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
 	// Get gateway-global settings (read-only runtime configuration; any
 	// authenticated user may read these without requiring Platform Admin).
@@ -1319,6 +1354,8 @@ type OpenShellServer interface {
 	GetGatewayConfig(context.Context, *sandboxv1.GetGatewayConfigRequest) (*sandboxv1.GetGatewayConfigResponse, error)
 	// Update settings or policy at sandbox or global scope.
 	UpdateConfig(context.Context, *UpdateConfigRequest) (*UpdateConfigResponse, error)
+	// Get a durable sandbox configuration update operation by id.
+	GetConfigUpdateOperation(context.Context, *GetConfigUpdateOperationRequest) (*GetConfigUpdateOperationResponse, error)
 	// Get the load status of a specific policy version.
 	GetSandboxPolicyStatus(context.Context, *GetSandboxPolicyStatusRequest) (*GetSandboxPolicyStatusResponse, error)
 	// List policy history for a sandbox.
@@ -1332,7 +1369,9 @@ type OpenShellServer interface {
 	ReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
 	// Register startup and acknowledge an exact validated runtime configuration.
 	ReportSandboxConfiguration(context.Context, *ReportSandboxConfigurationRequest) (*ReportSandboxConfigurationResponse, error)
-	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
+	// Get provider environment for a sandbox (called by the sandbox supervisor at
+	// startup and by its poll loop). Polling projection of the provider
+	// environment delivered over ConnectSupervisor; removed with the polling RPCs.
 	GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
@@ -1345,9 +1384,11 @@ type OpenShellServer interface {
 	//
 	// The supervisor opens this stream at startup and keeps it alive for the
 	// sandbox lifetime. The gateway uses it to coordinate relay channels for
-	// SSH connect, ExecSandbox, and targetable sandbox services. Raw service
-	// bytes flow over RelayStream calls (separate HTTP/2 streams on the same
-	// connection), not over this stream.
+	// SSH connect, ExecSandbox, targetable sandbox services, and configuration
+	// delivery. Supervisors advertise optional stream features in
+	// SupervisorHello, and the gateway sends only payloads the supervisor
+	// advertises. Raw service bytes flow over RelayStream calls (separate HTTP/2
+	// streams on the same connection), not over this stream.
 	ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error)
@@ -1377,6 +1418,9 @@ type OpenShellServer interface {
 	PeerReportProviderReadiness(context.Context, *ReportProviderReadinessRequest) (*ReportProviderReadinessResponse, error)
 	PeerReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error)
 	PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error)
+	// Best-effort notification to the replica that owns a supervisor session.
+	// The receiver rebuilds snapshots from authoritative state.
+	PeerNotifyConfigUpdate(context.Context, *PeerNotifyConfigUpdateRequest) (*PeerNotifyConfigUpdateResponse, error)
 	// Watch a sandbox and stream updates.
 	//
 	// This stream can include:
@@ -1574,6 +1618,9 @@ func (UnimplementedOpenShellServer) GetGatewayConfig(context.Context, *sandboxv1
 func (UnimplementedOpenShellServer) UpdateConfig(context.Context, *UpdateConfigRequest) (*UpdateConfigResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateConfig not implemented")
 }
+func (UnimplementedOpenShellServer) GetConfigUpdateOperation(context.Context, *GetConfigUpdateOperationRequest) (*GetConfigUpdateOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetConfigUpdateOperation not implemented")
+}
 func (UnimplementedOpenShellServer) GetSandboxPolicyStatus(context.Context, *GetSandboxPolicyStatusRequest) (*GetSandboxPolicyStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxPolicyStatus not implemented")
 }
@@ -1627,6 +1674,9 @@ func (UnimplementedOpenShellServer) PeerReportEndpointStatus(context.Context, *R
 }
 func (UnimplementedOpenShellServer) PeerGetSandboxProviderStatus(context.Context, *GetSandboxProviderStatusRequest) (*GetSandboxProviderStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PeerGetSandboxProviderStatus not implemented")
+}
+func (UnimplementedOpenShellServer) PeerNotifyConfigUpdate(context.Context, *PeerNotifyConfigUpdateRequest) (*PeerNotifyConfigUpdateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PeerNotifyConfigUpdate not implemented")
 }
 func (UnimplementedOpenShellServer) WatchSandbox(*WatchSandboxRequest, grpc.ServerStreamingServer[SandboxStreamEvent]) error {
 	return status.Error(codes.Unimplemented, "method WatchSandbox not implemented")
@@ -2487,6 +2537,24 @@ func _OpenShell_UpdateConfig_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_GetConfigUpdateOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetConfigUpdateOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetConfigUpdateOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetConfigUpdateOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetConfigUpdateOperation(ctx, req.(*GetConfigUpdateOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandboxPolicyStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxPolicyStatusRequest)
 	if err := dec(in); err != nil {
@@ -2763,6 +2831,24 @@ func _OpenShell_PeerGetSandboxProviderStatus_Handler(srv interface{}, ctx contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).PeerGetSandboxProviderStatus(ctx, req.(*GetSandboxProviderStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_PeerNotifyConfigUpdate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PeerNotifyConfigUpdateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).PeerNotifyConfigUpdate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_PeerNotifyConfigUpdate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).PeerNotifyConfigUpdate(ctx, req.(*PeerNotifyConfigUpdateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3278,6 +3364,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_UpdateConfig_Handler,
 		},
 		{
+			MethodName: "GetConfigUpdateOperation",
+			Handler:    _OpenShell_GetConfigUpdateOperation_Handler,
+		},
+		{
 			MethodName: "GetSandboxPolicyStatus",
 			Handler:    _OpenShell_GetSandboxPolicyStatus_Handler,
 		},
@@ -3332,6 +3422,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PeerGetSandboxProviderStatus",
 			Handler:    _OpenShell_PeerGetSandboxProviderStatus_Handler,
+		},
+		{
+			MethodName: "PeerNotifyConfigUpdate",
+			Handler:    _OpenShell_PeerNotifyConfigUpdate_Handler,
 		},
 		{
 			MethodName: "SubmitPolicyAnalysis",

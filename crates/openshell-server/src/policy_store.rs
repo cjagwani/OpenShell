@@ -4,7 +4,7 @@
 use crate::persistence::{
     DraftChunkRecord, PersistenceError, PersistenceResult, PolicyRecord, SetResourceVersion, Store,
 };
-use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload};
+use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload, StoredConfigUpdateOperation};
 use openshell_core::proto::{NetworkPolicyRule, Sandbox, SandboxPolicy as ProtoSandboxPolicy};
 use prost::Message;
 use std::collections::HashMap;
@@ -37,6 +37,7 @@ pub struct AtomicPolicyRevisionWrite {
     /// Populate the create-time baseline, or replace it while startup admission
     /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
+    pub operation: Option<StoredConfigUpdateOperation>,
 }
 
 pub fn policy_record_for_atomic_write(
@@ -136,6 +137,14 @@ pub fn project_policy_revision_onto_sandbox(
 }
 
 pub trait PolicyStoreExt {
+    /// Insert version-one policy history when the sandbox still has no policy
+    /// revisions. Existing history and apply status are left untouched.
+    async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()>;
+
     async fn put_policy_revision(
         &self,
         id: &str,
@@ -270,6 +279,17 @@ pub trait PolicyStoreExt {
 }
 
 impl PolicyStoreExt for Store {
+    async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        match self {
+            Self::Postgres(store) => store.put_initial_policy_revision(record, workspace).await,
+            Self::Sqlite(store) => store.put_initial_policy_revision(record, workspace).await,
+        }
+    }
+
     async fn put_policy_revision(
         &self,
         id: &str,
@@ -711,6 +731,7 @@ mod tests {
             .read_write
             .push("/new-static-path".to_string());
         let write = AtomicPolicyRevisionWrite {
+            operation: None,
             id: "revision".to_string(),
             sandbox_id: "sandbox".to_string(),
             workspace: "default".to_string(),

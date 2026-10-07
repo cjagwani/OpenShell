@@ -234,6 +234,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_notify_config_update(
+        &self,
+        _request: tonic::Request<proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<proto::PeerNotifyConfigUpdateResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<proto::ReportProviderReadinessRequest>,
@@ -795,6 +802,17 @@ impl OpenShell for TestOpenShell {
         _: tonic::Request<proto::ExchangeProviderSubjectTokenRequest>,
     ) -> Result<Response<proto::ExchangeProviderSubjectTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
+    }
+
+    #[allow(unused_qualifications)]
+    async fn get_config_update_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetConfigUpdateOperationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::GetConfigUpdateOperationResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("unused"))
     }
 
     async fn update_config(

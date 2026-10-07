@@ -12,8 +12,9 @@ pub mod rootfs_tar;
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId, ObjectListQuery, ObjectName, ObjectRecord,
-    ObjectType, POLICY_OBJECT_TYPE, Store, WriteCondition,
+    CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE, DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectId,
+    ObjectListQuery, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE, Store,
+    WriteCondition,
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
@@ -695,6 +696,25 @@ impl fmt::Debug for ComputeRuntime {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SupervisorSessionStateUpdate<'a> {
+    Connected {
+        instance_id: &'a str,
+        admission: Option<&'a openshell_core::proto::SandboxConfigurationAdmission>,
+        readiness: SupervisorRuntimeReadiness,
+    },
+    Disconnected {
+        terminal_delivery_finalized: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum SupervisorRuntimeReadiness {
+    Initializing,
+    Ready,
+    ReadyAfterAdmission,
+}
+
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
@@ -1255,6 +1275,18 @@ impl ComputeRuntime {
                     .await);
             }
         };
+
+        if let Err(status) = Box::pin(crate::grpc::policy::initialize_policy_history(
+            self.store.as_ref(),
+            &sandbox,
+            crate::grpc::policy::InitialPolicyHistoryStatus::Pending,
+        ))
+        .await
+        {
+            return Err(self
+                .compensate_failed_create(&sandbox, lifecycle_guard, None, status)
+                .await);
+        }
 
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
@@ -4705,8 +4737,52 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true, Some(instance_id), false)
-            .await
+        self.set_supervisor_session_state(
+            sandbox_id,
+            SupervisorSessionStateUpdate::Connected {
+                instance_id,
+                admission: None,
+                readiness: SupervisorRuntimeReadiness::Ready,
+            },
+        )
+        .await
+    }
+
+    pub async fn supervisor_runtime_ready(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+    ) -> Result<(), String> {
+        self.set_supervisor_session_state(
+            sandbox_id,
+            SupervisorSessionStateUpdate::Connected {
+                instance_id,
+                admission: None,
+                readiness: SupervisorRuntimeReadiness::ReadyAfterAdmission,
+            },
+        )
+        .await
+    }
+
+    pub async fn supervisor_session_admission(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+        admission: &openshell_core::proto::SandboxConfigurationAdmission,
+    ) -> Result<(), String> {
+        self.set_supervisor_session_state(
+            sandbox_id,
+            SupervisorSessionStateUpdate::Connected {
+                instance_id,
+                admission: Some(admission),
+                readiness: if self.supervisor_sessions.is_runtime_ready(sandbox_id) {
+                    SupervisorRuntimeReadiness::Ready
+                } else {
+                    SupervisorRuntimeReadiness::Initializing
+                },
+            },
+        )
+        .await
     }
 
     pub async fn supervisor_session_disconnected(
@@ -4729,9 +4805,9 @@ impl ComputeRuntime {
             .map_err(|error| error.to_string())?;
         self.set_supervisor_session_state_from_snapshot(
             sandbox_id,
-            false,
-            None,
-            terminal_delivery_finalized,
+            SupervisorSessionStateUpdate::Disconnected {
+                terminal_delivery_finalized,
+            },
             existing,
         )
         .await?;
@@ -4750,9 +4826,11 @@ impl ComputeRuntime {
                 .map_err(|error| error.to_string())?;
             self.set_supervisor_session_state_from_snapshot(
                 sandbox_id,
-                true,
-                Some(&instance_id),
-                false,
+                SupervisorSessionStateUpdate::Connected {
+                    instance_id: &instance_id,
+                    admission: None,
+                    readiness: SupervisorRuntimeReadiness::Ready,
+                },
                 existing,
             )
             .await?;
@@ -4762,7 +4840,7 @@ impl ComputeRuntime {
 
     async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
         if self.supervisor_sessions.has_session(sandbox_id) {
-            return Ok(true);
+            return Ok(self.supervisor_sessions.is_runtime_ready(sandbox_id));
         }
         Ok(self
             .supervisor_session_owner_instance_id(sandbox_id)
@@ -4790,9 +4868,7 @@ impl ComputeRuntime {
     async fn set_supervisor_session_state(
         &self,
         sandbox_id: &str,
-        connected: bool,
-        instance_id: Option<&str>,
-        terminal_delivery_finalized: bool,
+        update: SupervisorSessionStateUpdate<'_>,
     ) -> Result<(), String> {
         let _guard = self.sync_lock.lock().await;
         let existing = self
@@ -4800,30 +4876,54 @@ impl ComputeRuntime {
             .get_message::<Sandbox>(sandbox_id)
             .await
             .map_err(|err| err.to_string())?;
-        self.set_supervisor_session_state_from_snapshot(
-            sandbox_id,
-            connected,
-            instance_id,
-            terminal_delivery_finalized,
-            existing,
-        )
-        .await
+        self.set_supervisor_session_state_from_snapshot(sandbox_id, update, existing)
+            .await
     }
 
     async fn set_supervisor_session_state_from_snapshot(
         &self,
         sandbox_id: &str,
-        connected: bool,
-        instance_id: Option<&str>,
-        terminal_delivery_finalized: bool,
+        update: SupervisorSessionStateUpdate<'_>,
         mut existing: Option<Sandbox>,
     ) -> Result<(), String> {
+        let (connected, instance_id, admission, terminal_delivery_finalized, readiness) =
+            match update {
+                SupervisorSessionStateUpdate::Connected {
+                    instance_id,
+                    admission,
+                    readiness,
+                } => (true, Some(instance_id), admission, false, Some(readiness)),
+                SupervisorSessionStateUpdate::Disconnected {
+                    terminal_delivery_finalized,
+                } => (false, None, None, terminal_delivery_finalized, None),
+            };
+        let runtime_ready = matches!(
+            readiness,
+            Some(
+                SupervisorRuntimeReadiness::Ready | SupervisorRuntimeReadiness::ReadyAfterAdmission
+            )
+        );
+        let require_activated_configuration = matches!(
+            readiness,
+            Some(SupervisorRuntimeReadiness::ReadyAfterAdmission)
+        );
         for attempt in 1..=SUPERVISOR_SESSION_CAS_RETRY_LIMIT {
             let Some(current) = existing else {
                 return Ok(());
             };
             let current_phase =
                 SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+            if connected
+                && runtime_ready
+                && require_activated_configuration
+                && current
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.configuration_activated)
+                    != Some(true)
+            {
+                return Err("sandbox configuration is not durably admitted".to_string());
+            }
             if connected
                 && (provisioning_deadline::timed_out(&current)
                     || matches!(
@@ -4872,21 +4972,32 @@ impl ComputeRuntime {
                     expected_resource_version,
                     |sandbox| {
                         if connected {
-                            ensure_supervisor_ready_status(&mut sandbox.status);
                             let status = sandbox.status.get_or_insert_with(Default::default);
-                            let same_instance =
-                                Some(status.main_process_instance_id.as_str()) == instance_id;
-                            status.main_process_instance_id =
-                                instance_id.unwrap_or_default().to_string();
-                            status.exit_code = None;
-                            set_next_restart_at_ms(status, 0);
-                            if !same_instance || main_process_started_at_ms(status) == 0 {
-                                set_main_process_started_at_ms(
-                                    status,
-                                    openshell_core::time::now_ms(),
+                            if let Some(admission) = admission {
+                                status.configuration_admission = Some(admission.clone());
+                                status.configuration_activated = Some(
+                                    admission.state
+                                        == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted),
                                 );
                             }
-                            sandbox.set_phase(SandboxPhase::Ready as i32);
+                            // An admission-only update leaves restart state to
+                            // the instance that last reported runtime readiness.
+                            if runtime_ready {
+                                let same_instance =
+                                    Some(status.main_process_instance_id.as_str()) == instance_id;
+                                status.main_process_instance_id =
+                                    instance_id.unwrap_or_default().to_string();
+                                status.exit_code = None;
+                                set_next_restart_at_ms(status, 0);
+                                if !same_instance || main_process_started_at_ms(status) == 0 {
+                                    set_main_process_started_at_ms(
+                                        status,
+                                        openshell_core::time::now_ms(),
+                                    );
+                                }
+                                ensure_supervisor_ready_status(&mut sandbox.status);
+                                sandbox.set_phase(SandboxPhase::Ready as i32);
+                            }
                         } else {
                             ensure_supervisor_not_ready_status(&mut sandbox.status);
                             sandbox.set_phase(SandboxPhase::Provisioning as i32);
@@ -5246,6 +5357,10 @@ impl ComputeRuntime {
         for (object_type, label) in [
             (POLICY_OBJECT_TYPE, "policy revisions"),
             (DRAFT_CHUNK_OBJECT_TYPE, "draft policy chunks"),
+            (
+                CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE,
+                "configuration component observations",
+            ),
         ] {
             self.store
                 .delete_by_scope(object_type, sandbox.object_id())
@@ -7355,6 +7470,7 @@ pub fn new_test_runtime_with_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy_store::PolicyStoreExt;
     use futures::stream;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
@@ -10483,6 +10599,19 @@ mod tests {
             )
             .await
             .unwrap();
+        runtime
+            .store
+            .put_scoped(
+                CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE,
+                "observation-owned",
+                "observation-owned",
+                sandbox.object_workspace(),
+                sandbox.object_id(),
+                br#"{"outcome":"applied"}"#,
+                None,
+            )
+            .await
+            .unwrap();
         session
     }
 
@@ -10548,6 +10677,18 @@ mod tests {
             runtime
                 .store
                 .get(DRAFT_CHUNK_OBJECT_TYPE, "draft-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get(
+                    CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE,
+                    "observation-owned",
+                )
                 .await
                 .unwrap()
                 .is_some(),
@@ -14148,6 +14289,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_session_admission_preserves_repair_on_same_instance() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut admission = SandboxConfigurationAdmission {
+            instance_id: "configuration-1".into(),
+            state: ConfigurationAdmissionState::Rejected.into(),
+            policy_version: 7,
+            policy_hash: "policy-hash".into(),
+            config_revision: 11,
+            provider_env_revision: 13,
+            error: "invalid image policy".into(),
+        };
+
+        runtime
+            .supervisor_session_admission("sb-1", "supervisor-1", &admission)
+            .await
+            .unwrap();
+        let rejected = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.phase(), SandboxPhase::Provisioning as i32);
+        assert_eq!(
+            rejected.status.as_ref().unwrap().configuration_activated,
+            Some(false)
+        );
+        assert!(
+            runtime
+                .supervisor_runtime_ready("sb-1", "supervisor-1")
+                .await
+                .unwrap_err()
+                .contains("not durably admitted")
+        );
+
+        admission.state = ConfigurationAdmissionState::Accepted.into();
+        admission.error.clear();
+        runtime
+            .supervisor_session_admission("sb-1", "supervisor-1", &admission)
+            .await
+            .unwrap();
+        let repaired = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.phase(), SandboxPhase::Provisioning as i32);
+        // Admission alone leaves restart bookkeeping to runtime readiness.
+        assert!(
+            repaired
+                .status
+                .as_ref()
+                .unwrap()
+                .main_process_instance_id
+                .is_empty()
+        );
+        assert_eq!(
+            repaired.status.as_ref().unwrap().configuration_activated,
+            Some(true)
+        );
+
+        runtime
+            .supervisor_runtime_ready("sb-1", "supervisor-1")
+            .await
+            .unwrap();
+        let ready = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(
+            ready.status.as_ref().unwrap().main_process_instance_id,
+            "supervisor-1"
+        );
+    }
+
+    #[tokio::test]
     async fn supervisor_session_connected_rejects_stopped_sandbox() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Stopped);
@@ -14186,9 +14411,11 @@ mod tests {
         runtime
             .set_supervisor_session_state_from_snapshot(
                 "sb-1",
-                true,
-                Some("test-generation"),
-                false,
+                SupervisorSessionStateUpdate::Connected {
+                    instance_id: "test-generation",
+                    admission: None,
+                    readiness: SupervisorRuntimeReadiness::Ready,
+                },
                 stale,
             )
             .await
@@ -16129,6 +16356,36 @@ mod tests {
             1,
             "database should have resource_version: 1 after create"
         );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_persists_initial_policy_revision() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record(
+            "sb-initial-policy",
+            "initial-policy",
+            SandboxPhase::Provisioning,
+        );
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(policy.clone()),
+            ..Default::default()
+        });
+
+        runtime.create_sandbox(sandbox, None, false).await.unwrap();
+
+        let revision = runtime
+            .store
+            .get_latest_policy("sb-initial-policy")
+            .await
+            .unwrap()
+            .expect("initial policy revision");
+        assert_eq!(revision.version, 1);
+        assert_eq!(
+            revision.policy_hash,
+            crate::grpc::policy::deterministic_policy_hash(&policy)
+        );
+        assert_eq!(revision.status, "pending");
     }
 
     #[tokio::test]

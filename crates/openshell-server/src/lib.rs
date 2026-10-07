@@ -17,6 +17,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
 mod credentials;
@@ -35,6 +36,7 @@ mod otel_tracing;
 mod pagination;
 mod persistence;
 pub(crate) mod policy_store;
+mod provider_config_operation;
 mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
@@ -278,6 +280,9 @@ pub struct ServerState {
     /// In-memory bus for sandbox update notifications.
     pub sandbox_watch_bus: SandboxWatchBus,
 
+    /// Gateway-local wakeups for durable configuration-operation waiters.
+    pub(crate) config_update_operation_watch_bus: config_update_operation::OperationWatchBus,
+
     /// In-memory bus for server process logs.
     pub tracing_log_bus: TracingLogBus,
 
@@ -306,6 +311,11 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
+    /// Coalescing queue and delivery worker for supervisor configuration delivery.
+    pub(crate) config_delivery: config_delivery::ConfigDelivery,
+
+    /// Routing boundary for local or remote supervisor configuration delivery.
+    pub(crate) supervisor_config_transport: Arc<dyn config_delivery::SupervisorConfigTransport>,
 
     /// Stable identity for this gateway process.
     pub replica_id: String,
@@ -382,6 +392,14 @@ fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool
 }
 
 impl ServerState {
+    /// Return the configuration delivery boundary for supervisor sessions.
+    #[must_use]
+    pub fn supervisor_config_transport(
+        &self,
+    ) -> Arc<dyn config_delivery::SupervisorConfigTransport> {
+        Arc::clone(&self.supervisor_config_transport)
+    }
+
     /// Create new server state.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -433,6 +451,12 @@ impl ServerState {
             .oidc
             .as_ref()
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
+        let supervisor_config_transport: Arc<dyn config_delivery::SupervisorConfigTransport> =
+            Arc::new(config_delivery::LocalSupervisorConfigTransport::new(
+                Arc::clone(&supervisor_sessions),
+            ));
+        let config_delivery =
+            config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         Self {
             config,
             store,
@@ -440,6 +464,7 @@ impl ServerState {
             credentials,
             sandbox_index,
             sandbox_watch_bus,
+            config_update_operation_watch_bus: config_update_operation::OperationWatchBus::new(),
             tracing_log_bus,
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
@@ -447,6 +472,8 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            config_delivery,
+            supervisor_config_transport,
             replica_id,
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
@@ -817,6 +844,13 @@ pub(crate) async fn run_server(
 
     let state = Arc::new(state);
 
+    grpc::policy::backfill_legacy_policy_history(&state)
+        .await
+        .map_err(|error| Error::execution(error.to_string()))?;
+    config_update_operation::repair_query_projections(&state)
+        .await
+        .map_err(|error| Error::execution(error.to_string()))?;
+
     // Reconcile local-driver running intent before watchers spawn so their
     // first snapshots observe the post-start backend state. Explicitly stopped
     // sandboxes remain stopped.
@@ -974,6 +1008,8 @@ pub(crate) async fn run_server(
     );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    config_delivery::spawn_owner_reconciler(state.clone(), Duration::from_secs(30));
+    config_update_operation::spawn_reconciler(state.clone(), Duration::from_secs(5));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     shutdown_signal().await;

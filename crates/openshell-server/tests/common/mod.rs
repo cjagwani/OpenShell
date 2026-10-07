@@ -9,6 +9,10 @@
 
 #![allow(dead_code)]
 
+use openshell_core::proto::{
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
+};
+
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
@@ -19,8 +23,7 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    GetSandboxConfigResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
     ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PeerRelayFrame,
     ProviderResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame,
@@ -53,6 +56,13 @@ pub struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_notify_config_update(
+        &self,
+        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
@@ -461,6 +471,17 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
         let (_tx, rx) = mpsc::channel(1);
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    #[allow(unused_qualifications)]
+    async fn get_config_update_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetConfigUpdateOperationRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::GetConfigUpdateOperationResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("unused"))
     }
 
     async fn update_config(

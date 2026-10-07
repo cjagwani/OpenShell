@@ -20,6 +20,9 @@ import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
+  ConfigApplyOutcome,
+  ConfigUpdateOperationState,
+  ConfigUpdateWaitMode,
   type ExecSandboxInputSchema,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
@@ -451,9 +454,13 @@ export interface SandboxConfig {
 export interface SetPolicyOptions extends SandboxWorkspaceOptions {
   /** Pin the sandbox resource version for optimistic concurrency (u64 as string). */
   expectedResourceVersion?: string;
-  /** Poll getConfig until the applied policy hash is observed. */
+  /**
+   * Ask the gateway to wait for a durable terminal apply result. Gateways that
+   * do not track completion, such as those that keep configuration polling,
+   * return the committed result without an operation.
+   */
   wait?: boolean;
-  /** Bound the `wait` poll (seconds). Default 60. */
+  /** Bound the server-side wait in seconds. Default 60. */
   waitTimeoutSecs?: number;
 }
 
@@ -463,6 +470,20 @@ export interface UpdateConfigResult {
   /** u64 rendered as a string. */
   settingsRevision: string;
   deleted: boolean;
+  operationId?: string;
+  operationState?: 'unspecified' | 'pending' | 'applied' | 'inactive' | 'failed' | 'superseded' | 'cancelled';
+  /** Application may complete with a degraded outcome. */
+  operationOutcome?:
+    | 'unspecified'
+    | 'applied'
+    | 'ignored_duplicate'
+    | 'ignored_stale'
+    | 'retained_local_override'
+    | 'degraded'
+    | 'failed_retained_last_known_good'
+    | 'failed_closed'
+    | 'unsupported';
+  operationError?: string;
 }
 
 // ---- enum → lowercase string -----------------------------------------------
@@ -599,6 +620,16 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
     policyHash: resp.policyHash,
     settingsRevision: resp.settingsRevision.toString(),
     deleted: resp.deleted,
+    ...(resp.operation
+      ? {
+          operationId: resp.operation.operationId,
+          operationState: (ConfigUpdateOperationState[resp.operation.state]?.toLowerCase() ??
+            'unspecified') as UpdateConfigResult['operationState'],
+          operationOutcome: (ConfigApplyOutcome[resp.operation.outcome]?.toLowerCase() ??
+            'unspecified') as UpdateConfigResult['operationOutcome'],
+          operationError: resp.operation.sanitizedError,
+        }
+      : {}),
   };
 }
 
@@ -1726,8 +1757,8 @@ export class SandboxClient {
 
   // Update the sandbox-scoped policy. Sandbox scope (global=false) may only
   // change network_policies; static fields must match the create-time policy or
-  // the gateway rejects the update. With `wait`, poll getConfig until the
-  // applied policy hash is observed.
+  // the gateway rejects the update. With `wait`, the gateway owns the durable
+  // wait and returns only after a terminal apply result.
   async setPolicy(
     name: string,
     policy: MessageInitShape<typeof SandboxPolicySchema>,
@@ -1739,10 +1770,25 @@ export class SandboxClient {
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
+        waitMode: options?.wait ? ConfigUpdateWaitMode.WAIT_FOR_COMPLETION : ConfigUpdateWaitMode.COMMIT_ONLY,
+        waitTimeout: durationFromMs(Math.max(0, (options?.waitTimeoutSecs ?? 60) * 1000)),
       });
       const result = updateConfigResult(resp);
-      if (options?.wait)
-        await this.waitForPolicyHash(name, result.policyHash, options.waitTimeoutSecs, options.workspace);
+      if (options?.wait && resp.operation) {
+        if (
+          resp.operation.state === ConfigUpdateOperationState.FAILED ||
+          resp.operation.state === ConfigUpdateOperationState.SUPERSEDED ||
+          resp.operation.state === ConfigUpdateOperationState.CANCELLED
+        ) {
+          throw new SdkError(
+            'rpc',
+            `policy update operation '${resp.operation.operationId}' did not apply: ${resp.operation.sanitizedError}`,
+          );
+        }
+        if (![ConfigUpdateOperationState.APPLIED, ConfigUpdateOperationState.INACTIVE].includes(resp.operation.state)) {
+          throw new SdkError('rpc', `gateway returned non-terminal operation '${resp.operation.operationId}'`);
+        }
+      }
       return result;
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -1767,37 +1813,6 @@ export class SandboxClient {
       return updateConfigResult(resp);
     } catch (e) {
       throw fromConnect(e);
-    }
-  }
-
-  // Poll getConfig until the applied policy hash is observed. Each poll RPC is
-  // bounded by the remaining deadline (deadlineOptions), so a stalled getConfig
-  // cannot make the returned promise outlive timeoutSecs.
-  private async waitForPolicyHash(
-    name: string,
-    policyHash: string,
-    timeoutSecs = 60,
-    workspace?: string,
-  ): Promise<void> {
-    const deadline = Date.now() + timeoutSecs * 1000;
-    let delay = 100;
-    for (;;) {
-      let config: SandboxConfig;
-      const pollOptions = deadlineOptions(deadline - Date.now());
-      try {
-        config = await this.getConfig(name, { ...pollOptions, workspace });
-      } catch (e) {
-        if (pollOptions.signal?.aborted || Date.now() >= deadline) {
-          throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
-        }
-        throw e instanceof SdkError ? e : fromConnect(e);
-      }
-      if (config.policyHash === policyHash) return;
-      if (Date.now() >= deadline) {
-        throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
-      }
-      await waitSleep(delay, deadline);
-      delay = Math.min(delay * 2, 2000);
     }
   }
 }
