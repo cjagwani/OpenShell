@@ -74,12 +74,43 @@ const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CO
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PodmanSandboxDriverConfig {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_non_empty_string_list"
-    )]
+    #[serde(default, deserialize_with = "deserialize_gpu_cdi_devices")]
     pub cdi_devices: Option<Vec<String>>,
     mounts: Vec<PodmanDriverMountConfig>,
+}
+
+fn deserialize_gpu_cdi_devices<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let devices = deserialize_optional_non_empty_string_list(deserializer)?;
+    if let Some(devices) = devices.as_deref() {
+        validate_gpu_cdi_devices(devices).map_err(serde::de::Error::custom)?;
+    }
+    Ok(devices)
+}
+
+fn validate_gpu_cdi_devices(devices: &[String]) -> Result<(), String> {
+    for device in devices {
+        // Podman's device field also accepts host paths. Require the NVIDIA GPU
+        // qualifier and CDI device-name grammar, including ':' for MIG names.
+        // https://github.com/cncf-tags/container-device-interface/blob/main/pkg/parser/parser.go
+        let valid = device.strip_prefix("nvidia.com/gpu=").is_some_and(|name| {
+            let bytes = name.as_bytes();
+            bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.iter().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+                })
+        });
+        if !valid {
+            return Err(
+                "driver_config.cdi_devices must contain NVIDIA GPU CDI names (nvidia.com/gpu=<name>)"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 impl PodmanSandboxDriverConfig {
@@ -1112,6 +1143,9 @@ fn build_base_spec(
     supervisor_bin_path: Option<&Path>,
     tls_secret_names: Option<&[String; 1]>,
 ) -> Result<ContainerSpec, ComputeDriverError> {
+    if let Some(device_ids) = gpu_device_ids {
+        validate_gpu_cdi_devices(device_ids).map_err(ComputeDriverError::InvalidArgument)?;
+    }
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
@@ -2169,6 +2203,91 @@ mod tests {
             spec["devices"][0]["path"].as_str(),
             Some("nvidia.com/gpu=0")
         );
+    }
+
+    #[test]
+    fn container_spec_accepts_nvidia_cdi_device_names() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        for device in [
+            "nvidia.com/gpu=0",
+            "nvidia.com/gpu=all",
+            "nvidia.com/gpu=GPU-5b2d",
+            "nvidia.com/gpu=MIG-5b2d",
+            "nvidia.com/gpu=0:1",
+            "nvidia.com/gpu=gpu_0.1",
+        ] {
+            let mut sandbox = test_sandbox("test-id", "test-name");
+            sandbox.spec = Some(DriverSandboxSpec {
+                resource_requirements: Some(gpu_resources(None)),
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(cdi_devices_config(&[device])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let spec = build_container_spec(&sandbox, &test_config());
+            assert_eq!(spec["devices"][0]["path"], device);
+        }
+    }
+
+    #[test]
+    fn container_spec_rejects_invalid_explicit_and_resolved_cdi_devices() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        for device in [
+            "/dev/sda",
+            "/dev",
+            "/dev/sda:/dev/sda:rwm",
+            "dev/sda",
+            "../dev/sda",
+            "nvidia.com/gpu=",
+            "nvidia.com/gpu=/dev/sda",
+            "nvidia.com/gpu=0:/dev/sda:rwm",
+            "nvidia.com/gpu=0/1",
+            "nvidia.com/gpu=0=1",
+            "nvidia.com/gpu=0,1",
+            "nvidia.com/gpu=-0",
+            "nvidia.com/gpu=0:",
+            "nvidia.com/gpu=0 ",
+            " nvidia.com/gpu=0",
+            "nvidia.com/gpu=0\n",
+            "nvidia.com/gpu=0\0",
+            "nvidia.com/gpu=é",
+            "nvidia.com/nic=0",
+            "example.com/gpu=0",
+        ] {
+            let mut sandbox = test_sandbox("test-id", "test-name");
+            sandbox.spec = Some(DriverSandboxSpec {
+                resource_requirements: Some(gpu_resources(Some(2))),
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=1", device])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let config = test_config();
+            let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+            assert!(
+                matches!(err, ComputeDriverError::InvalidArgument(_)),
+                "{device:?}: {err}"
+            );
+
+            // Preselected devices must be checked even without caller driver config.
+            sandbox.spec.as_mut().unwrap().template = None;
+            let devices = vec!["nvidia.com/gpu=1".to_string(), device.to_string()];
+            let err = build_container_spec_with_token_and_gpu_devices(
+                &sandbox,
+                &config,
+                None,
+                Some(&devices),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ComputeDriverError::InvalidArgument(_)),
+                "{device:?}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -2949,6 +2949,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_sandbox_create_rejects_host_device_paths() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            allow_driver_config: true,
+            ..Default::default()
+        });
+        for device in ["/dev/sda", "/dev", "/dev/sda:/dev/sda:rwm"] {
+            let sandbox = DriverSandbox {
+                spec: Some(DriverSandboxSpec {
+                    resource_requirements: Some(gpu_resources(None)),
+                    template: Some(DriverSandboxTemplate {
+                        driver_config: Some(cdi_devices_config(&[device])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
+            assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+            assert!(err.to_string().contains("NVIDIA GPU CDI names"));
+        }
+    }
+
+    #[tokio::test]
     async fn validate_sandbox_create_passes_explicit_cdi_device_id_without_inventory() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
