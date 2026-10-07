@@ -313,11 +313,11 @@ as false passes or silently re-enter the archive.
 
 The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
 OCI image identity and working-directory behavior shared by the Docker and
-Podman drivers against installed artifacts. CI runs it on Docker rootful,
-Podman rootful, and Podman rootless guests:
+Podman drivers against installed deb packages on Ubuntu and rpm packages on
+Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
 
 ```shell
-nix run .#tmachine -- test ubuntu-docker-rootful binaries oci-image
+nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
 ```
 
 The shared suite also runs in the existing ARM64 Docker E2E workflow for
