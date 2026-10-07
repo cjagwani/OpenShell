@@ -19,12 +19,11 @@
       ansible.builtin.include_role:
         name: tmachine_container_runtime
 
-    - name: Require rootless Podman for the E2E workload fixtures
+    - name: Require Podman for the E2E workload fixtures
       ansible.builtin.assert:
         that:
           - tmachine_container_runtime_name == 'podman'
-          - tmachine_container_runtime_is_rootless
-        fail_msg: The Podman E2E archive requires the rootless Podman environment
+        fail_msg: The Podman E2E archive requires a Podman environment
 
     - name: Create Podman E2E test directory
       become: true
@@ -53,9 +52,13 @@
         mode: "0600"
 
     - name: Load Podman E2E workload image
+      become: "{{ not tmachine_container_runtime_is_rootless }}"
       ansible.builtin.command:
         argv:
           - podman
+          - --remote
+          - --url
+          - "unix://{{ tmachine_container_runtime_socket }}"
           - load
           - --input
           - "{{ podman_e2e_test_root }}/openshell-e2e-python-dev.tar"
@@ -64,6 +67,7 @@
         XDG_RUNTIME_DIR: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}"
 
     - name: Run Podman E2E archive tests
+      become: "{{ not tmachine_container_runtime_is_rootless }}"
       ansible.builtin.command:
         argv:
           - cargo-nextest
