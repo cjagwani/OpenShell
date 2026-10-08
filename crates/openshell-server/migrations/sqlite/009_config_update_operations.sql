@@ -1,7 +1,3 @@
-CREATE TABLE IF NOT EXISTS sandbox_config_fences (
-    sandbox_id TEXT PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE
-);
-
 ALTER TABLE objects
     ADD COLUMN next_attempt_at_ms INTEGER;
 

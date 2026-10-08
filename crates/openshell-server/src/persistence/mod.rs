@@ -527,10 +527,8 @@ impl Store {
     pub async fn insert_existing_config_operation(
         &self,
         operation: &crate::storage_proto::StoredConfigUpdateOperation,
-        workspace: &str,
-        sandbox_name: &str,
     ) -> PersistenceResult<()> {
-        store_dispatch!(self.insert_existing_config_operation(operation, workspace, sandbox_name))
+        store_dispatch!(self.insert_existing_config_operation(operation))
     }
 
     /// Update an operation payload and its query columns with one CAS write.

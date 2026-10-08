@@ -153,6 +153,8 @@ impl ObjectType for StoredConfigUpdateOperation {
     }
 }
 
+/// Desired-state revision an operation waits for. Completion compares only the
+/// dimension the operation changed; the other field is not correlated.
 #[derive(Debug, Clone, Copy)]
 pub struct OperationTarget {
     pub policy_version: u32,

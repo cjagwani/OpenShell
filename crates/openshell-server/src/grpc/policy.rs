@@ -229,7 +229,7 @@ async fn finish_unchanged_config_update(
     );
     state
         .store
-        .insert_existing_config_operation(&record, workspace, sandbox.object_name())
+        .insert_existing_config_operation(&record)
         .await
         .map_err(|error| {
             super::persistence_error_to_status(error, "persist unchanged update operation")
@@ -4370,8 +4370,7 @@ async fn handle_update_config_inner(
     };
 
     // Avoid redundant validation and snapshot construction within one gateway.
-    // The database transaction owns cross-replica serialization and completes
-    // the unchanged target dimension after locking the sandbox fence.
+    // Across replicas, the settings write is a compare-and-swap on its record.
     let config_guard = state.settings_mutex.lock().await;
 
     let mut projected_annotations = response_annotations.clone();

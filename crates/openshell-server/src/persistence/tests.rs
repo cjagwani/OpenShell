@@ -244,7 +244,6 @@ fn embedded_migrators_include_config_operation_query_support() {
     ] {
         let sql =
             migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 009"));
-        assert!(sql.contains("sandbox_config_fences"));
         assert!(sql.contains("objects_type_status_due_idx"));
         assert!(sql.contains("next_attempt_at_ms"));
     }
@@ -1579,14 +1578,32 @@ async fn pending_operation_queries_are_scoped_bounded_and_due_ordered() {
 }
 
 #[tokio::test]
-async fn configuration_transactions_fill_the_other_target_dimension() {
+async fn configuration_transactions_store_only_the_requested_target() {
     let store = test_store().await;
+    Box::pin(assert_configuration_transactions_store_only_the_requested_target(&store)).await;
+}
 
-    let settings_sandbox = policy_test_sandbox("target-settings-write", "target-settings-write");
+#[tokio::test]
+#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
+async fn postgres_configuration_transactions_store_only_the_requested_target() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
+    let store = Store::connect(&url).await.unwrap();
+    Box::pin(assert_configuration_transactions_store_only_the_requested_target(&store)).await;
+}
+
+// Completion correlates on the dimension an operation changed, so writes keep
+// the requested target instead of stamping the other dimension's revision.
+async fn assert_configuration_transactions_store_only_the_requested_target(store: &Store) {
+    let suffix = uuid::Uuid::new_v4();
+
+    let settings_sandbox = policy_test_sandbox(
+        &format!("target-settings-write-{suffix}"),
+        &format!("target-settings-write-{suffix}"),
+    );
     store.put_message(&settings_sandbox).await.unwrap();
     store
         .put_policy_revision(
-            "target-settings-policy",
+            &format!("target-settings-policy-{suffix}"),
             settings_sandbox.object_id(),
             "default",
             1,
@@ -1596,16 +1613,10 @@ async fn configuration_transactions_fill_the_other_target_dimension() {
         .await
         .unwrap();
     let settings_operation = config_operation_for(&settings_sandbox, 0, 1);
-    let settings_operation_id = settings_operation
-        .operation
-        .as_ref()
-        .unwrap()
-        .operation_id
-        .clone();
     store
         .put_if_with_operation(
             crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            "target-settings-record",
+            &format!("target-settings-record-{suffix}"),
             settings_sandbox.object_name(),
             "default",
             br#"{"revision":1,"settings":{}}"#,
@@ -1615,21 +1626,21 @@ async fn configuration_transactions_fill_the_other_target_dimension() {
         )
         .await
         .unwrap();
-    let settings_operation = store
-        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&settings_operation_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(settings_operation.target_policy_version, 1);
-    assert_eq!(settings_operation.target_settings_revision, 1);
+    assert_eq!(
+        stored_operation_target(store, &settings_operation).await,
+        (0, 1)
+    );
 
-    let policy_sandbox = policy_test_sandbox("target-policy-write", "target-policy-write");
+    let policy_sandbox = policy_test_sandbox(
+        &format!("target-policy-write-{suffix}"),
+        &format!("target-policy-write-{suffix}"),
+    );
     store.put_message(&policy_sandbox).await.unwrap();
     let settings_seed = config_operation_for(&policy_sandbox, 0, 2);
     store
         .put_if_with_operation(
             crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            "target-policy-settings-record",
+            &format!("target-policy-settings-record-{suffix}"),
             policy_sandbox.object_name(),
             "default",
             br#"{"revision":2,"settings":{}}"#,
@@ -1645,15 +1656,9 @@ async fn configuration_transactions_fill_the_other_target_dimension() {
         .unwrap()
         .unwrap();
     let policy_operation = config_operation_for(&policy_sandbox, 1, 0);
-    let policy_operation_id = policy_operation
-        .operation
-        .as_ref()
-        .unwrap()
-        .operation_id
-        .clone();
     store
         .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
-            id: "target-policy-revision".to_string(),
+            id: format!("target-policy-revision-{suffix}"),
             sandbox_id: policy_sandbox.object_id().to_string(),
             workspace: "default".to_string(),
             version: 1,
@@ -1663,17 +1668,39 @@ async fn configuration_transactions_fill_the_other_target_dimension() {
             expected_resource_version: current.metadata.as_ref().unwrap().resource_version,
             annotations: StdHashMap::new(),
             backfill_policy: None,
-            operation: Some(policy_operation),
+            operation: Some(policy_operation.clone()),
         })
         .await
         .unwrap();
-    let policy_operation = store
-        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&policy_operation_id)
+    assert_eq!(
+        stored_operation_target(store, &policy_operation).await,
+        (1, 0)
+    );
+
+    let mut unchanged = config_operation_for(&policy_sandbox, 1, 0);
+    unchanged.response_policy_version = 1;
+    store
+        .insert_existing_config_operation(&unchanged)
+        .await
+        .unwrap();
+    assert_eq!(stored_operation_target(store, &unchanged).await, (1, 0));
+}
+
+async fn stored_operation_target(
+    store: &Store,
+    operation: &crate::storage_proto::StoredConfigUpdateOperation,
+) -> (u32, u64) {
+    let stored = store
+        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(
+            &operation.operation.as_ref().unwrap().operation_id,
+        )
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(policy_operation.target_policy_version, 1);
-    assert_eq!(policy_operation.target_settings_revision, 2);
+    (
+        stored.target_policy_version,
+        stored.target_settings_revision,
+    )
 }
 
 async fn settings_projection_uses_locked_sandbox_version(
@@ -1945,136 +1972,6 @@ async fn operation_insert_failure_rolls_back_policy_and_projection() {
         before.metadata.as_ref().unwrap().resource_version
     );
     assert!(after.metadata.as_ref().unwrap().annotations.is_empty());
-}
-
-#[tokio::test]
-#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
-async fn postgres_policy_and_settings_operations_allocate_serial_targets() {
-    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
-    let first = Store::connect(&url).await.unwrap();
-    let second = Store::connect(&url).await.unwrap();
-    let sandbox_id = uuid::Uuid::new_v4().to_string();
-    let sandbox = policy_test_sandbox(&sandbox_id, &sandbox_id);
-    first.put_message(&sandbox).await.unwrap();
-    let current = first
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let settings_operation = config_operation_for(&sandbox, 0, 1);
-    let settings_operation_id = settings_operation
-        .operation
-        .as_ref()
-        .unwrap()
-        .operation_id
-        .clone();
-    let policy_operation = config_operation_for(&sandbox, 1, 0);
-    let policy_operation_id = policy_operation
-        .operation
-        .as_ref()
-        .unwrap()
-        .operation_id
-        .clone();
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-    let settings_barrier = barrier.clone();
-    let policy = SandboxPolicy::default();
-
-    let (settings_result, policy_result) = tokio::join!(
-        async {
-            settings_barrier.wait().await;
-            first
-                .put_if_with_operation(
-                    crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-                    &uuid::Uuid::new_v4().to_string(),
-                    sandbox.object_name(),
-                    "default",
-                    br#"{"revision":1,"settings":{}}"#,
-                    super::WriteCondition::MustCreate,
-                    &settings_operation,
-                    None,
-                )
-                .await
-        },
-        async {
-            barrier.wait().await;
-            second
-                .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    sandbox_id: sandbox_id.clone(),
-                    workspace: "default".to_string(),
-                    version: 1,
-                    policy_payload: policy.encode_to_vec(),
-                    policy_hash: "serial-target".to_string(),
-                    provenance: StdHashMap::new(),
-                    expected_resource_version: current.metadata.as_ref().unwrap().resource_version,
-                    annotations: StdHashMap::new(),
-                    backfill_policy: None,
-                    operation: Some(policy_operation),
-                })
-                .await
-        }
-    );
-    settings_result.unwrap();
-    policy_result.unwrap();
-
-    let settings = first
-        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&settings_operation_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let policy = first
-        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&policy_operation_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let targets = [
-        (
-            settings.target_policy_version,
-            settings.target_settings_revision,
-        ),
-        (
-            policy.target_policy_version,
-            policy.target_settings_revision,
-        ),
-    ];
-    assert!(targets.contains(&(1, 1)), "committed targets: {targets:?}");
-    assert_ne!(targets, [(0, 1), (1, 0)]);
-
-    for policy_request in [false, true] {
-        let mut unchanged = if policy_request {
-            config_operation_for(&sandbox, 1, 0)
-        } else {
-            config_operation_for(&sandbox, 0, 1)
-        };
-        unchanged.response_policy_version = u32::from(policy_request);
-        first
-            .insert_existing_config_operation(&unchanged, "default", sandbox.object_name())
-            .await
-            .unwrap();
-        let stored = first
-            .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(
-                &unchanged.operation.as_ref().unwrap().operation_id,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (
-                stored.target_policy_version,
-                stored.target_settings_revision
-            ),
-            (1, 1)
-        );
-        assert!(
-            first
-                .list_pending_config_operations_for_scope(&sandbox_id)
-                .await
-                .unwrap()
-                .iter()
-                .any(|record| record.metadata.as_ref().unwrap().id
-                    == stored.metadata.as_ref().unwrap().id)
-        );
-    }
 }
 
 #[tokio::test]

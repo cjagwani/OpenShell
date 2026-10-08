@@ -70,78 +70,6 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, '{}'::jsonb, 1, $10)
     Ok(())
 }
 
-async fn lock_sandbox_config_fence(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    sandbox_id: &str,
-) -> PersistenceResult<()> {
-    sqlx::query(
-        "INSERT INTO sandbox_config_fences (sandbox_id) VALUES ($1) ON CONFLICT DO NOTHING",
-    )
-    .bind(sandbox_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| map_db_error(&error))?;
-    sqlx::query("SELECT sandbox_id FROM sandbox_config_fences WHERE sandbox_id = $1 FOR UPDATE")
-        .bind(sandbox_id)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|error| map_db_error(&error))?;
-    Ok(())
-}
-
-async fn operation_with_current_policy_target(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    record: &crate::storage_proto::StoredConfigUpdateOperation,
-) -> PersistenceResult<crate::storage_proto::StoredConfigUpdateOperation> {
-    let sandbox_id = record
-        .operation
-        .as_ref()
-        .ok_or_else(|| PersistenceError::Encode("update operation payload missing".to_string()))?
-        .sandbox_id
-        .as_str();
-    let version: Option<i64> = sqlx::query_scalar(
-        "SELECT version FROM objects WHERE object_type = $1 AND scope = $2 ORDER BY version DESC LIMIT 1",
-    )
-    .bind(POLICY_OBJECT_TYPE)
-    .bind(sandbox_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|error| map_db_error(&error))?;
-    let mut record = record.clone();
-    record.target_policy_version =
-        version.map_or(0, |value| u32::try_from(value).unwrap_or(u32::MAX));
-    Ok(record)
-}
-
-async fn operation_with_current_settings_target(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    record: &crate::storage_proto::StoredConfigUpdateOperation,
-    workspace: &str,
-    sandbox_name: &str,
-) -> PersistenceResult<crate::storage_proto::StoredConfigUpdateOperation> {
-    let payload: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT payload FROM objects WHERE object_type = $1 AND workspace = $2 AND name = $3",
-    )
-    .bind(crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE)
-    .bind(workspace)
-    .bind(sandbox_name)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|error| map_db_error(&error))?;
-    let revision = payload
-        .as_deref()
-        .map(serde_json::from_slice::<serde_json::Value>)
-        .transpose()
-        .map_err(|error| {
-            PersistenceError::Decode(format!("decode settings payload failed: {error}"))
-        })?
-        .and_then(|value| value.get("revision").and_then(serde_json::Value::as_u64))
-        .unwrap_or(0);
-    let mut record = record.clone();
-    record.target_settings_revision = revision;
-    Ok(record)
-}
-
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
     pool: PgPool,
@@ -465,17 +393,7 @@ RETURNING resource_version, created_at_ms, updated_at_ms
             .begin()
             .await
             .map_err(|error| map_db_error(&error))?;
-        let sandbox_id = operation_record
-            .operation
-            .as_ref()
-            .ok_or_else(|| {
-                PersistenceError::Encode("update operation payload missing".to_string())
-            })?
-            .sandbox_id
-            .clone();
-        lock_sandbox_config_fence(&mut tx, &sandbox_id).await?;
-        let mut operation_record =
-            operation_with_current_policy_target(&mut tx, operation_record).await?;
+        let mut operation_record = operation_record.clone();
         let row = match condition {
             WriteCondition::MustCreate => sqlx::query(
                 r"
@@ -581,30 +499,13 @@ WHERE object_type = 'sandbox' AND id = $1 AND resource_version = $4
     pub async fn insert_existing_config_operation(
         &self,
         record: &crate::storage_proto::StoredConfigUpdateOperation,
-        workspace: &str,
-        sandbox_name: &str,
     ) -> PersistenceResult<()> {
-        let sandbox_id = &record
-            .operation
-            .as_ref()
-            .ok_or_else(|| {
-                PersistenceError::Encode("update operation payload missing".to_string())
-            })?
-            .sandbox_id;
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|error| map_db_error(&error))?;
-        lock_sandbox_config_fence(&mut tx, sandbox_id).await?;
-        // Keep the dimension observed by the request. If it changed meanwhile,
-        // reconciliation supersedes this operation instead of claiming success.
-        let record = if record.response_policy_version != 0 {
-            operation_with_current_settings_target(&mut tx, record, workspace, sandbox_name).await?
-        } else {
-            operation_with_current_policy_target(&mut tx, record).await?
-        };
-        insert_update_operation_postgres(&mut tx, &record, current_time_ms()).await?;
+        insert_update_operation_postgres(&mut tx, record, current_time_ms()).await?;
         tx.commit().await.map_err(|error| map_db_error(&error))?;
         Ok(())
     }
@@ -1511,8 +1412,6 @@ ON CONFLICT DO NOTHING
         let wrapped_payload = policy_payload_from_record(&record)?;
         let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
 
-        lock_sandbox_config_fence(&mut tx, &write.sandbox_id).await?;
-
         let row = sqlx::query(
             r"
 SELECT payload, resource_version
@@ -1581,18 +1480,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
         .map_err(|e| map_db_error(&e))?;
 
         if let Some(operation_record) = write.operation.as_ref() {
-            let sandbox_name = sandbox
-                .metadata
-                .as_ref()
-                .map_or("", |metadata| metadata.name.as_str());
-            let operation_record = operation_with_current_settings_target(
-                &mut tx,
-                operation_record,
-                &write.workspace,
-                sandbox_name,
-            )
-            .await?;
-            insert_update_operation_postgres(&mut tx, &operation_record, now_ms).await?;
+            insert_update_operation_postgres(&mut tx, operation_record, now_ms).await?;
         }
 
         sqlx::query(
